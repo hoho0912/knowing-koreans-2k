@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>knowing-koreans — 전시 콘셉트 호감도</title>
+    <meta
+      name="description"
+      content="한국 인구통계 합성 페르소나(Nemotron-Personas-Korea)에 박물관·문화 시나리오를 던져 다중 LLM 응답을 비교하는 perspective-taking 도구."
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo",
+          "Noto Sans KR", sans-serif;
+      }
+      #root {
+        min-height: 100vh;
+      }
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #fafafa;
+        color: #555;
+        font-size: 14px;
+        flex-direction: column;
+        gap: 12px;
+        z-index: 100;
+        transition: opacity 0.4s ease;
+      }
+      #boot .spinner {
+        width: 24px;
+        height: 24px;
+        border: 3px solid #e0e0e0;
+        border-top-color: #2e7d32;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      #boot.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot">
+      <div class="spinner"></div>
+      <div>
+        <strong>knowing-koreans</strong> 시각화 로딩 중…
+        <div style="opacity: 0.7; font-size: 12px; margin-top: 4px">
+          (stlite + Pyodide 초기화에 10~30초 걸릴 수 있습니다)
+        </div>
+      </div>
+    </div>
+    <div id="root"></div>
+
+    <script type="module">
+      import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+
+      mount(
+        {
+          entrypoint: "streamlit_app.py",
+          requirements: ["altair"],
+          files: {
+            "streamlit_app.py": {
+              url: "./streamlit_app.py",
+            },
+            "data.csv": {
+              url: "./data/exhibition_appeal_2026-04-where-things-linger.csv",
+            },
+          },
+          streamlitConfig: {
+            "client.toolbarMode": "viewer",
+            "client.showSidebarNavigation": false,
+          },
+        },
+        document.getElementById("root"),
+      );
+
+      // 첫 렌더 감지 후 부트 스피너 숨김
+      const boot = document.getElementById("boot");
+      const root = document.getElementById("root");
+      const obs = new MutationObserver(() => {
+        if (root.querySelector(".stApp, .main, [data-testid='stAppViewContainer']")) {
+          setTimeout(() => {
+            boot.classList.add("hidden");
+            setTimeout(() => boot.remove(), 500);
+          }, 800);
+          obs.disconnect();
+        }
+      });
+      obs.observe(root, { childList: true, subtree: true });
+
+      // 안전장치: 60초 후 강제 숨김
+      setTimeout(() => {
+        boot.classList.add("hidden");
+        setTimeout(() => boot.remove(), 500);
+      }, 60000);
+    </script>
+  </body>
+</html>

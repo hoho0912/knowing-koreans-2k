@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# 데이터 (큰 파일은 깃허브 안 올림)
+backend/nvidia-personas/
+backend/data/
+backend/response/
+backend/logs/
+
+# 핸드오프 작업본 (전역 CLAUDE.md 백업 등 sensitive)
+_handoff_to_winpc/
+
+# 결과 — backend/results는 백업용으로 로컬에만, frontend/data로 복사된 것만 깃허브
+backend/results/
+
+# OS
+.DS_Store
+Thumbs.db
+._*
+.__*
+
+# 사용자별 IDE/Agent 설정 + 서버 PAT/접속 일지 (sensitive)
+.claude/
+.server-logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

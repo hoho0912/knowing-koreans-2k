@@ -1,0 +1,19 @@
+# knowing-koreans backend 의존성
+# Python 3.9+
+
+# 페르소나 데이터셋 로드
+huggingface_hub>=0.25.0
+pyarrow>=15.0.0
+pandas>=2.0.0
+
+# LLM 호출 (OpenAI 직접 + OpenRouter는 OpenAI SDK + base_url 변경)
+openai>=1.40.0
+
+# Ollama 로컬 호출 (선택, requests로도 가능)
+# ollama>=0.3.0
+
+# 환경변수 로드
+python-dotenv>=1.0.0
+
+# HTTP
+requests>=2.32.0
