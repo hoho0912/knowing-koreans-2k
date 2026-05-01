@@ -11,7 +11,7 @@
 
 ## Nemotron-Personas-Korea 스키마 (실제 26 필드, 2026-04-28 다운본 기준 검증)
 
-> 데이터 규모: parquet 9샤드, **1,000,000행** (= 1M demographic records). 한 행당 페르소나 1명. CLAUDE.md/vuski의 "7M"는 행 수가 아니라 **7개 narrative 컬럼 × 1M = 개념적 곱셈**. 실제 시뮬은 행 단위.
+> 데이터 규모: parquet 9샤드, **1,000,000행** (= 1M demographic records). 한 행당 페르소나 1명. CLAUDE.md의 "7M"는 행 수가 아니라 **7개 narrative 컬럼 × 1M = 개념적 곱셈**. 실제 시뮬은 행 단위.
 > 라이선스: CC BY 4.0. HF 다운 시 토큰 미필요(공개).
 
 ### 식별자 (1)
@@ -21,7 +21,7 @@
 - `sex` — 성별 (예: "여자", "남자")
 - `age` — 나이 (정수)
 - `marital_status` — 혼인 상태 (예: "미혼", "배우자있음")
-- `military_status` — 병역 상태 (예: "비현역", "현역") **★ 한국 특화, vuski에 없음**
+- `military_status` — 병역 상태 (예: "비현역", "현역") **★ 한국 특화**
 - `family_type` — 가구 형태 (예: "1인 가구", "부모와 동거", "자녀와 거주 (배우자 별거)")
 - `housing_type` — 주거 형태 (예: "아파트", "원룸", "다세대주택")
 - `education_level` — 학력 (예: "중학교", "4년제 대학교")
@@ -46,7 +46,7 @@
 - `skills_and_expertise_list` — 숙련 리스트 (Python list, 4~5 항목) **★ 추가 발견**
 - `career_goals_and_ambitions` — 목표·포부
 
-> 출처: 실제 다운본의 `df.columns` 직접 확인 (2026-04-28). 이전 문서(vuski README + index.html DOM 추정)에는 일부 필드 누락·이름 차이가 있었으며 본 절은 실제 데이터셋 기준으로 정정됨.
+> 출처: 실제 다운본의 `df.columns` 직접 확인 (2026-04-28). 이전 문서에는 일부 필드 누락·이름 차이가 있었으며 본 절은 실제 데이터셋 기준으로 정정됨.
 
 ## 시뮬 결과 DB 스키마 (CSV)
 
@@ -63,7 +63,7 @@
 - `response_file` — raw JSON 파일명
 
 ### 페르소나 26 필드 (사본)
-- 위 Nemotron 26필드를 그대로 복사 — 시각화에서 페르소나 정보를 별도 join 없이 바로 쓰기 위함 (vuski 패턴 차용)
+- 위 Nemotron 26필드를 그대로 복사 — 시각화에서 페르소나 정보를 별도 join 없이 바로 쓰기 위함
 
 ### 시나리오별 응답 필드
 - 시나리오마다 `question.md`의 응답 스키마에 따라 컬럼이 추가됨

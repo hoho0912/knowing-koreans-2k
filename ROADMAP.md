@@ -28,7 +28,7 @@
 ## M2 — stlite 정적 사이트
 
 **산출물**
-- frontend/index.html — vuski 패턴 (stlite 0.85.x + Plotly)
+- frontend/index.html — stlite 0.85.x + Plotly 정적 호스팅
 - frontend/data/exhibition_appeal_2026-04.csv 게시
 - frontend/scenarios/exhibition_appeal/context.md 노출용 사본
 - 시나리오 셀렉터 UI (드롭다운 또는 탭, 단일 시나리오라도 미리 구조 잡음)
@@ -65,12 +65,11 @@
 
 - 페르소나가 자기 이전 응답을 컨텍스트로 참조하는 구조
 - 시뮬 결과가 다음 시뮬의 입력이 되는 시계열 체인
-- vuski 본인이 Threads에서 제안한 방향
 
 ## 우선순위 메모
 
-- M1·M2는 "vuski 수준 + 박물관 도메인" 시연. 외부에 보여줄 수 있는 수준.
-- M3가 진짜 차별점 발화 — 시나리오 모듈화 + Stage 2 페르소나가 vuski에 없는 부분.
+- M1·M2는 박물관 도메인 시연 — 외부에 보여줄 수 있는 수준.
+- M3가 진짜 차별점 발화 — 시나리오 모듈화 + Stage 2 페르소나.
 - M4·M5는 학술 논문 가능성도 있는 야심. M1~M3 완료 후 결정.
 
 ## 범위 대조 점검 (이 ROADMAP가 빠뜨린 것 / 우회한 것)

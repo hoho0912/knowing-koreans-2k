@@ -71,7 +71,7 @@ DIVERSITY_METRICS = [
 ]
 
 
-# 응답 카드 표시 필드 (vuski 패턴 차용)
+# 응답 카드 표시 필드
 CARD_DISPLAY = {
     "header_chip": "visit_intent",
     "score_badge": "appeal_score",
