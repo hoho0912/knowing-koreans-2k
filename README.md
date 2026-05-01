@@ -239,8 +239,6 @@ python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 
 ## 기여
 
-- 새 시나리오 PR 환영 — `scenarios/<your_id>/` 4파일 (+ 가능하면 `*_research_notes.md`).
-- 분석 LLM prompt 개선·새 시각화 axis 추가도 환영.
 - 이슈는 GitHub Issues로 — 버그 리포트는 가능하면 `spec.json` + `status.json` 동봉.
 
 ---
@@ -250,7 +248,7 @@ python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 본 저장소나 산출물을 학술·실무에 인용할 때:
 
 ```
-hoho0912 (2026). knowing-koreans: a synthetic-persona × multi-LLM
+Hosan Kim(2026). knowing-koreans: a synthetic-persona × multi-LLM
 hypothesis generator for Korean curators.
 https://github.com/hoho0912/knowing-koreans-2k
 ```
