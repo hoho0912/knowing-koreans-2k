@@ -24,6 +24,9 @@ backend/logs/
 # 핸드오프 작업본 (전역 CLAUDE.md 백업 등 sensitive)
 _handoff_to_winpc/
 
+# 외부 공개 비대상 — 특정 기관·전시 큐레이션 자료 (내부 회람용으로만 보존)
+_internal/
+
 # 결과 — backend/results는 백업용으로 로컬에만, frontend/data로 복사된 것만 깃허브
 backend/results/
 
