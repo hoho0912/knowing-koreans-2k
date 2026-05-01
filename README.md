@@ -33,22 +33,22 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 ```
 
 핵심 차별점:
-- **컨텍스트 grounding**: 시나리오마다 1차 자료(전시 기획서·정책 문헌·인터뷰)를 컨텍스트로 LLM에 주입.
-- **시나리오 모듈화**: `scenarios/<name>/` 디렉토리 4파일(`context.md` / `question.md` / `scenario_vars.json` / `viz.py`)만 채우면 새 주제 추가.
-- **다중 LLM 동시 비교**: OpenAI · OpenRouter (Anthropic / Google / xAI / Meta 등) · Ollama 로컬을 단일 인터페이스로 호출.
-- **시점 메타데이터**: 각 응답에 `context_snapshot_id` + `timestamp` 기록 — 같은 시나리오를 시점별 컨텍스트로 반복 측정해 시계열 분석.
+- **컨텍스트 grounding**: 시나리오마다 1차 자료(전시 기획서·정책 문헌·인터뷰)를 컨텍스트로 LLM에 주입합니다.
+- **시나리오 모듈화**: `scenarios/<name>/` 디렉토리 4파일(`context.md` / `question.md` / `scenario_vars.json` / `viz.py`)만 채우면 새 주제를 추가할 수 있습니다.
+- **다중 LLM 동시 비교**: OpenAI · OpenRouter (Anthropic / Google / xAI / Meta 등) · Ollama 로컬을 단일 인터페이스로 호출합니다.
+- **시점 메타데이터**: 각 응답에 `context_snapshot_id` + `timestamp`를 기록해, 같은 시나리오를 시점별 컨텍스트로 반복 측정하면 시계열 분석이 가능합니다.
 
 ---
 
 ## 본 저장소가 검증해 본 것
 
-본 저장소는 단순히 합성 페르소나에 LLM을 호출해 결과를 보여주는 것이 아니라, 페르소나 시뮬이 의미 있게 작동하기 위한 사전 단계와 한국 박물관 도메인의 첫 공개 사례를 함께 수행했다. 핵심은 다음 셋이다.
+본 저장소는 단순히 합성 페르소나에 LLM을 호출해 결과를 보여주는 데 그치지 않고, 페르소나 시뮬이 의미 있게 작동하기 위한 사전 단계와 한국 박물관 도메인의 첫 공개 사례를 함께 수행했습니다. 핵심은 다음 세 가지입니다.
 
-### 1. 페르소나 신호를 통과시키는 모델만 본 측정에 사용한다
+### 1. 페르소나 신호를 통과시키는 모델만 본 측정에 사용합니다
 
-다중 LLM 시뮬에서 가장 흔히 나타나는 실패는 RLHF로 정렬된 모델이 페르소나 narrative를 무시하고 평균 응답에 회귀하는 패턴이다. 같은 페르소나에 다른 모델을 던졌을 때 모델 간 응답 격차(모델 편향)가 다른 페르소나에 같은 모델을 던졌을 때 페르소나 간 응답 격차(페르소나 변동)보다 크면, 페르소나 시뮬은 사실상 모델 fingerprint 보고서가 된다.
+다중 LLM 시뮬에서 가장 흔히 나타나는 실패는 RLHF로 정렬된 모델이 페르소나 narrative를 무시하고 평균 응답에 회귀하는 패턴입니다. 같은 페르소나에 여러 모델을 던졌을 때의 모델 간 응답 격차(모델 편향)가, 여러 페르소나에 같은 모델을 던졌을 때의 페르소나 간 응답 격차(페르소나 변동)보다 크면 페르소나 시뮬은 사실상 모델 fingerprint 보고서로 변질됩니다.
 
-본 저장소는 본 측정 전에 사전 측정 단계를 두어 이 비율을 노출하고, 페르소나 변동을 살리는 모델만 본 측정에 사용한다.
+본 저장소는 본 측정 전에 사전 측정 단계를 두어 이 비율을 노출하고, 페르소나 변동을 살리는 모델만 본 측정에 사용합니다.
 
 | 차수 | 시점 | 측정 규모 | 핵심 발견 |
 |---|---|---|---|
@@ -58,13 +58,13 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 | ④ 본 측정 7항목 | 4-29 저녁 | 페르소나 100명 × 모델 3종 = 응답 300건 | qwen3-max(std 0.89) / hermes-4-70b(std 0.69) / claude-haiku-4.5(mean 2.58) — 7항목 구조화 응답으로 ambivalence 가시화 |
 | ⑤ 본 라운드 N=1,000 | 5-01 새벽 | 페르소나 1,000명 × hermes-4-405b 단일 = 응답 1,000건 | **박물관 관람료 유료화 도입 논쟁 시나리오**. 5질문(Likert 3 + 카테고리 1 + 자유서술 1)을 단일 모델로 던져 페르소나 변동 폭을 본다 |
 
-사전 측정 없이 모델 1~2개로 곧바로 본 측정에 들어가면 모델 편향이 결과를 지배해 페르소나 시뮬 의미가 사라진다. 본 저장소는 이 절차를 공개해 후속 연구·도메인 응용이 같은 함정에 빠지지 않게 한다.
+사전 측정 없이 모델 1~2개로 곧바로 본 측정에 들어가면 모델 편향이 결과를 지배해 페르소나 시뮬의 의미가 사라집니다. 본 저장소는 이 절차를 공개해 후속 연구·도메인 응용이 같은 함정에 빠지지 않도록 했습니다.
 
 ### 2. 한국 박물관·문화 도메인 첫 시도
 
-본 저장소는 한국의 박물관·문화 분야에서 합성 페르소나 시뮬을 적용한 첫 공개 시도다. NVIDIA Nemotron-Personas-Korea의 한국 인구통계 분포(약 700만 페르소나 × 7개 narrative 컬럼)를 기반으로 박물관·전시·문화재 시나리오에 대한 응답을 큐레이터의 가설 발생 도구로 변환한다.
+본 저장소는 한국의 박물관·문화 분야에서 합성 페르소나 시뮬을 적용한 첫 공개 시도입니다. NVIDIA Nemotron-Personas-Korea의 한국 인구통계 분포(약 700만 페르소나 × 7개 narrative 컬럼)를 기반으로, 박물관·전시·문화재 시나리오에 대한 응답을 큐레이터의 가설 발생 도구로 변환합니다.
 
-**본 저장소가 외부 공개로 진행한 첫 사례는 박물관 관람료 유료화 도입 논쟁이다** — 국립중앙박물관 관람료를 유료화하자는 논쟁이 격렬한 상황에서 한국 인구통계 분포의 시민이 찬반 입장·지불 의향·취약계층 면제 조건·자유서술을 어떻게 응답하는지를 ⑤단계 N=1,000 측정으로 본다.
+**외부 공개로 진행한 첫 사례는 박물관 관람료 유료화 도입 논쟁입니다** — 국립중앙박물관 관람료 유료화 논쟁이 격렬한 상황에서, 한국 인구통계 분포의 시민이 찬반 입장·지불 의향·취약계층 면제 조건·자유서술을 어떻게 응답하는지 ⑤단계 N=1,000 측정으로 살펴봅니다.
 
 후속 시나리오 후보:
 
@@ -74,11 +74,11 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 
 ### 3. 결과 소개 페이지
 
-원시 데이터(CSV·JSON)와 분석 코드는 본 저장소에 그대로 있지만, 큐레이터·기획자가 결과를 빠르게 훑을 수 있도록 결과 소개 페이지를 GitHub Pages에 별도 배포한다:
+원시 데이터(CSV·JSON)와 분석 코드는 본 저장소에 그대로 두고, 큐레이터·기획자가 결과를 빠르게 훑을 수 있도록 결과 소개 페이지를 GitHub Pages에 별도 배포합니다.
 
 → https://hoho0912.github.io/knowing-koreans-2k/
 
-페이지는 stlite + Pyodide 기반으로 브라우저에서 직접 Python을 돌려 시뮬 결과를 차트로 띄운다. 현재 페이지에서는 **본 라운드 N=1,000 단면**(박물관 관람료 유료화 도입 논쟁 시나리오, 응답 성공 998건) 한 건만 공개하며, 12섹션 보고서 본문(측정 개요·한눈에 보기 차트·핵심 발견·큐레이터 관점·축별 분포·곱씹을 만한 응답·다음 질문·부록)을 그대로 노출한다. 1차 prototype 25건(전시 콘셉트 호감도 시나리오)은 도구 동작 확인용 사전 측정으로 본 저장소의 측정 라운드 표(아래)에 이력만 남겨 두며, 결과 소개 페이지에는 노출하지 않는다.
+페이지는 stlite + Pyodide 기반으로 브라우저에서 직접 Python을 돌려 시뮬 결과를 차트로 띄웁니다. 현재 페이지에서는 **본 라운드 N=1,000 단면**(박물관 관람료 유료화 도입 논쟁 시나리오, 응답 성공 998건) 한 건만 공개하며, 보고서 본문(측정 개요·한눈에 보기 차트·핵심 발견·큐레이터 관점·축별 분포·곱씹을 만한 응답·다음 질문·부록)을 그대로 노출합니다. 1차 prototype 25건(전시 콘셉트 호감도 시나리오)은 도구 동작 확인용 사전 측정이라 본 저장소의 측정 라운드 표(아래)에 이력만 남겨 두고, 결과 소개 페이지에는 노출하지 않습니다.
 
 | 영역 | 내용 |
 |---|---|
@@ -87,7 +87,7 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 | ⑨ 차트 5장 | 페르소나 연령·지역 분포 + 응답 분포(전체·인구통계 축별·모델별) |
 | ⑩ 곱씹을 만한 응답 | 998건 응답 중 큐레이터에게 의미 있는 인용 3건 + 큐레이션 활용 노트 |
 | ⑪ 다음에 던져볼 질문 | 본 라운드 약신호·모델 편향 의심 패턴을 후속 시나리오로 옮긴 5개 work item |
-| ⑫ 보고서 전문 | 12섹션 PDF 다운로드 + Markdown 전문 expander |
+| ⑫ 보고서 전문 | 보고서 PDF 다운로드 + Markdown 전문 expander |
 
 ---
 
@@ -116,7 +116,7 @@ cp .env.example .env.local
 |---|---|---|
 | `OPENAI_API_KEY` | OpenAI 직접 호출 | 선택 (OpenRouter만 써도 무관) |
 | `OPENROUTER_API_KEY` | 다중 모델 게이트웨이 | 권장 — Anthropic·Google·xAI·Meta 등 단일 키로 |
-| `HF_TOKEN` | Hugging Face | 선택 — Nemotron 데이터셋은 공개라 비필수, rate limit 회피용 |
+| `HF_TOKEN` | Hugging Face | 선택 — Nemotron 데이터셋은 공개라 필수가 아니지만, rate limit 회피용으로 권장합니다 |
 | `OLLAMA_HOST` | 로컬 Ollama | 기본값 `http://localhost:11434` |
 
 ### 3. 페르소나 데이터셋 1회 다운로드
@@ -177,7 +177,7 @@ scenarios/<your_scenario_id>/
 ### `question.md` 작성 원칙
 
 - 시뮬 질문은 단일 yes/no가 아니라 **다항목 구조화 응답**으로 — Likert 점수 + 자유서술 + 다항선택을 함께.
-- 응답 JSON 스키마를 같은 파일에 명시. 본 저장소의 `scenarios/exhibition_appeal/question.md`가 7항목 응답 (`appeal_score` / `visit_intent` / `key_attraction` / `key_concern` / `reason` / `preferred_companion` / `recommend_to`) 예시입니다.
+- 응답 JSON 스키마를 같은 파일에 명시. 본 저장소의 `scenarios/exhibition_appeal/question.md`가 5항목 응답 (`appeal_score` / `visit_intent` / `key_attraction` / `key_concern` / `reason`) 예시입니다.
 - 자유서술 항목은 권장 분량 명시 ("200~400자").
 
 ### `viz.py` 작성
@@ -234,7 +234,7 @@ run_dir/
 }
 ```
 
-필수 키: `run_id`, `n`, `models`. 나머지는 선택이지만 `topic`·`ctx`·`questions`·`schema_block`이 비어 있으면 응답 LLM에 전달할 컨텍스트와 형식 검증이 부실해진다. `created_at`은 ISO 8601 형식, `seed`는 양의 정수, `filters`는 페르소나 demographic 필터 dict (예: `{"province": "서울"}`).
+필수 키는 `run_id`, `n`, `models`입니다. 나머지는 선택이지만 `topic`·`ctx`·`questions`·`schema_block`이 비어 있으면 응답 LLM에 전달할 컨텍스트와 형식 검증이 부실해집니다. `created_at`은 ISO 8601 형식, `seed`는 양의 정수, `filters`는 페르소나 demographic 필터 dict입니다 (예: `{"province": "서울"}`).
 
 ### 실행
 
@@ -244,16 +244,18 @@ mkdir -p backend/results/run_2026-05-01_my_scenario
 python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 ```
 
-진행률은 `status.json`을 폴링해 확인 (gateway.py가 그 역할을 담당).
+진행률은 `status.json`을 폴링해 확인합니다 (gateway.py가 그 역할을 담당합니다).
 
 ### 보고서 산출물 구조
 
-`report.md` / `report.pdf` 4섹션:
+`report.md` / `report.pdf`의 기본 양식은 다음 4섹션입니다.
 
 1. **개요** — 시나리오 헤더 + 페르소나 인구통계 인포그래픽 (D 차트: 성별·연령 분포 / E 차트: 지역·교육·직업 / F 차트: 핵심 응답 axis 분포)
 2. **핵심 발견** — 분석 LLM이 추출한 패턴 3~5개 (응답 항목 간 ambivalence 포함)
 3. **axis별 분포** — 페르소나 axis × 응답 항목의 결정론 통계 표
 4. **곱씹을 만한 응답 + 다음 던져볼 질문** — 큐레이터가 후속 시나리오를 짜는 데 쓰도록 의도된 자유서술
+
+응답 ≥ 약 900건이 되면 `run_worker.py`가 cluster 분할 + cross-cluster diff + synthesis의 다단 합성 모드(B)로 자동 분기하므로, 본문은 이보다 풍부한 구조(측정 개요·한눈에 보기 차트·핵심 발견·큐레이터 관점·축별 분포 세부·곱씹을 만한 응답·다음 질문·부록 등)로 합성됩니다. 본 저장소가 공개한 ⑤단계 N=1,000 보고서가 이 모드 B 산출물입니다.
 
 ---
 
@@ -262,8 +264,8 @@ python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 응답을 받은 뒤 패턴 추출에 쓰는 "분석 LLM"은 측정용과 분리되어 있습니다 (`spec.json`의 `report_model` 필드).
 
 - 본 저장소 default 권장: 1M context · 강한 추론을 가진 하이엔드 모델 (예: Anthropic Claude Opus 4.7 1M, Google Gemini 2.5 Pro 1M, xAI Grok 4 등). 페르소나 narrative 전수 + 응답 raw 전수를 한 번에 시야에 둘 수 있어, 응답 항목 간 ambivalence·자유서술 의미·페르소나↔응답 정합성을 모두 봅니다.
-- 응답 ≤ 600건 영역에서는 단일 호출 가능. 응답 > 900건 영역에서는 `run_worker.py`가 자동으로 cluster 분할 + cross-cluster diff + synthesis의 다단 호출 모드(B)로 분기합니다.
-- 비용 절감 우선이면 `report_model`을 더 가벼운 모델로 교체 가능 — 다만 ambivalence 해석 품질이 떨어질 수 있다는 점은 감안하세요.
+- 응답 ≤ 600건 영역에서는 단일 호출이 가능합니다. 응답 > 900건 영역에서는 `run_worker.py`가 자동으로 cluster 분할 + cross-cluster diff + synthesis의 다단 호출 모드(B)로 분기합니다.
+- 비용 절감이 우선이면 `report_model`을 더 가벼운 모델로 교체할 수 있습니다 — 다만 ambivalence 해석 품질이 떨어질 수 있다는 점은 감안해 주세요.
 
 ---
 
@@ -291,23 +293,23 @@ python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 
 ## 알려진 한계
 
-- **LLM 균질화·고정관념** — 페르소나 narrative가 같아도 모델은 평균치로 수렴하는 경향. 다중 모델 비교로 모델별 편향 패턴 노출.
-- **Social desirability bias** — LLM은 사회적으로 적절한 답을 선호. 자유서술이 모델별로 비슷해질 위험.
-- **Nemotron 페르소나의 도메인 깊이 부족** — 박물관·문화 영역 prefer 컬럼은 합성에 한계. 본 저장소는 시나리오 `context.md`에 도메인 1차 자료를 grounding해 보완.
-- **시간·문화 일반화 한계** — 시점 컨텍스트(`context_snapshot`)로 한정.
-- **여론 예측 도구 아님** — 이 점을 보고서 본문에서도 명시 (`disclaimer` 섹션).
+- **LLM 균질화·고정관념** — 페르소나 narrative가 같아도 모델은 평균치로 수렴하는 경향이 있습니다. 다중 모델 비교로 모델별 편향 패턴을 노출합니다.
+- **Social desirability bias** — LLM은 사회적으로 적절한 답을 선호합니다. 자유서술이 모델별로 비슷해질 위험이 있습니다.
+- **Nemotron 페르소나의 도메인 깊이 부족** — 박물관·문화 영역의 prefer 컬럼은 합성에 한계가 있습니다. 본 저장소는 시나리오 `context.md`에 도메인 1차 자료를 grounding해 이를 보완합니다.
+- **시간·문화 일반화 한계** — 시점 컨텍스트(`context_snapshot`)로 한정합니다.
+- **여론 예측 도구가 아님** — 이 점은 보고서 본문에서도 명시합니다 (`disclaimer` 섹션).
 
 ---
 
 ## 기여
 
-- 이슈는 GitHub Issues로 — 버그 리포트는 가능하면 `spec.json` + `status.json` 동봉.
+- 이슈는 GitHub Issues로 받습니다 — 버그 리포트에는 가능하면 `spec.json` + `status.json`을 함께 첨부해 주세요.
 
 ---
 
 ## 인용
 
-본 저장소나 산출물을 학술·실무에 인용할 때:
+본 저장소나 산출물을 학술·실무에 인용하실 때 다음 양식을 사용해 주세요.
 
 ```
 Hosan Kim(2026). knowing-koreans: a synthetic-persona × multi-LLM
@@ -315,4 +317,4 @@ hypothesis generator for Korean curators.
 https://github.com/hoho0912/knowing-koreans-2k
 ```
 
-Nemotron-Personas-Korea 데이터셋 인용은 NVIDIA 측 안내를 따라 별도로 표기하세요.
+Nemotron-Personas-Korea 데이터셋 인용은 NVIDIA 측 안내를 따라 별도로 표기해 주세요.
