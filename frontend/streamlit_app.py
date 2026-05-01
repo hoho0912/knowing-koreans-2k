@@ -54,13 +54,13 @@ with st.expander("📋 전시 기획안", expanded=False):
 **관람료** — 무료 관람
 
 한 일상 사물이 만들어지고, 사용되고, 놓이고, 결국 박물관 소장품이 되는 과정을
-네 단계로 따라가는 narrative 전시입니다. 관람객은 자신이 일상에서 마주치는
+네 단계 흐름으로 따라가는 이야기 구성 전시입니다. 관람객은 자신이 일상에서 마주치는
 사물이 시간을 거쳐 어떤 자리에 놓이는지를 다시 보게 됩니다.
 
 **주요 볼거리**
-- 일상 사물 한 가지의 시간을 네 단계로 구성한 narrative 전시
+- 일상 사물 한 가지의 시간을 네 단계로 풀어낸 이야기 구성 전시
 - 사물의 자리 변화를 따라가는 구성
-- 작가 아티스트 토크 1회
+- 작가 토크 1회
 - 오프닝 행사 1회
 - 박물관 관람료 무료화 정책 시뮬용 가상 전시 변수
 """
@@ -77,11 +77,10 @@ c4.metric("응답 평균 시간", f"{df['elapsed_sec'].mean():.1f}초")
 st.divider()
 
 # ---------- 모델별 호감도 (핵심: 모델 편향 노출) ----------
-st.subheader("① 모델별 호감도 — *모델 편향 노출* 시각화")
+st.subheader("① 모델별 호감도 — 모델 편향이 보이는가")
 st.caption(
-    "다중 LLM 시뮬에서 흔히 나타나는 패턴: 같은 페르소나·같은 질문에도 모델마다 "
-    "일관된 점수를 부여하면, 그것은 페르소나의 의견이 아니라 모델의 편향이다. "
-    "이 25건에서 그 패턴이 그대로 드러난다."
+    "여러 LLM에 같은 페르소나와 같은 질문을 던졌을 때, 모델마다 점수가 일관되게 갈리면 "
+    "그건 페르소나의 의견이 아니라 모델 자체의 성향입니다. 이 25건에서도 그 패턴이 드러납니다."
 )
 
 model_agg = (
@@ -119,8 +118,11 @@ bar = (
 st.altair_chart(bar, use_container_width=True)
 
 # ---------- 페르소나 × 모델 매트릭스 ----------
-st.subheader("② 페르소나 × 모델 점수 매트릭스")
-st.caption("페르소나마다 모델별로 일관된 패턴이 보이는지 — 가로축 색이 모델 편향을, 세로축 변화가 페르소나 영향을 보여준다.")
+st.subheader("② 페르소나 × 모델 점수 표")
+st.caption(
+    "같은 페르소나에 모델별 점수가 일관된가, 같은 모델에 페르소나별 점수가 갈리는가를 한눈에 봅니다. "
+    "가로축(모델 간) 색 차이가 모델 편향, 세로축(페르소나 간) 변화가 페르소나 신호입니다."
+)
 
 pivot = df.pivot_table(
     index="persona_label",
@@ -166,19 +168,19 @@ intent_chart = (
 st.altair_chart(intent_chart, use_container_width=True)
 
 # ---------- 다양성 지표 ----------
-st.subheader("④ 다양성 지표 (균질화 비판 대응)")
+st.subheader("④ 응답 변동 지표 — 모델·페르소나 신호 분리")
 g1, g2 = st.columns(2)
 within_persona_std = df.groupby("persona_uuid")["appeal_score"].std().mean()
 within_model_std = df.groupby("model_short")["appeal_score"].std().mean()
 g1.metric(
     "같은 페르소나 내 모델 간 표준편차 (평균)",
     f"{within_persona_std:.2f}",
-    help="높을수록 모델 의견이 갈림 — 모델 편향이 강하다는 신호",
+    help="높을수록 같은 페르소나에 모델별 점수 차이가 크다는 뜻입니다 — 모델 편향이 강한 신호.",
 )
 g2.metric(
     "같은 모델 내 페르소나 간 표준편차 (평균)",
     f"{within_model_std:.2f}",
-    help="0에 가까우면 모델이 페르소나를 무시한다는 신호 — stereotyping 경고",
+    help="0에 가까우면 같은 모델이 모든 페르소나에 비슷한 점수를 매긴다는 뜻입니다 — 모델이 페르소나 차이를 평균치로 깎아내리고 있다는 신호.",
 )
 
 st.divider()
@@ -235,5 +237,5 @@ with st.expander("🗄 raw CSV 보기", expanded=False):
 
 st.caption(
     "⚙ knowing-koreans · 데이터: NVIDIA Nemotron-Personas-Korea (CC BY 4.0) · "
-    "다중 LLM via OpenRouter · stlite 정적 호스팅"
+    "OpenRouter 경유 다중 LLM · stlite 정적 호스팅"
 )
