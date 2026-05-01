@@ -1,0 +1,22 @@
+{
+  "run_id": "20260501-002643-8c5981",
+  "owner": "kk1",
+  "topic_short": "서울 용산 국립중앙박물관의 관람객이 늘어나면서 유료화 ",
+  "phase": "done",
+  "started_at": "2026-05-01T09:26:43.911921+09:00",
+  "updated_at": "2026-05-01T12:45:42.260820+09:00",
+  "n_total": 1000,
+  "n_done": 1000,
+  "n_ok": 998,
+  "n_fail": 2,
+  "avg_sec_per_call": 11.83,
+  "eta_sec": 0,
+  "report_ready": true,
+  "finished_at": "2026-05-01T12:45:42.260797+09:00",
+  "error": null,
+  "insight_mode": "B",
+  "insight_input_tokens": 4689327,
+  "insight_n_clusters": 10,
+  "insight_clusters_done": 10,
+  "insight_clusters_failed": 0
+}
