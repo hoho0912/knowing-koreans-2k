@@ -1,0 +1,2781 @@
+"""
+측정 워커 — gateway.py가 systemd-run으로 띄우는 백그라운드 프로세스.
+
+spec.json 한 개를 입력받아 페르소나 샘플링 → LLM 호출 루프 → 보고서 컴파일을
+수행하며 status.json을 주기적으로 atomic write로 갱신. 브라우저가 닫혀도
+이 프로세스는 systemd 관리하에 계속 돌아간다.
+
+흐름:
+  1. spec.json 로드
+  2. status.json 초기화 (phase=starting)
+  3. validate_spec() — drift 시 phase=error로 즉시 abort
+  4. 페르소나 풀 로드 (1M행)
+  5. 샘플링 → personas.csv
+  6. persona × model 루프
+     - 호출마다 result.csv append
+     - 5건마다 status.json 갱신 (n_done, avg, eta)
+     - SIGTERM 받으면 phase=cancelled로 종료
+  7. 보고서 LLM 호출 → report.md
+  8. weasyprint로 report.pdf
+  9. pypdfium2로 report.png (1페이지)
+  10. zipfile로 sources.zip (spec + personas + result + report)
+  11. phase=done
+
+CLI: python -m backend.run_worker /path/to/run_dir
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import signal
+import sys
+import textwrap
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.llm_runner import call_llm, parse_json_response  # noqa: E402
+from backend.persona_sampler import load_all_personas, sample_personas  # noqa: E402
+from backend.prompt_builder import (  # noqa: E402
+    CLUSTER_ANALYSIS_SYSTEM,
+    CLUSTER_ANALYSIS_USER_TEMPLATE,
+    CROSS_CLUSTER_DIFF_SYSTEM,
+    CROSS_CLUSTER_DIFF_USER_TEMPLATE,
+    INSIGHT_SINGLE_SYSTEM,
+    INSIGHT_SINGLE_USER_TEMPLATE,
+    RAW_RETRIEVAL_SYSTEM,
+    RAW_RETRIEVAL_USER_TEMPLATE,
+    SYNTHESIS_SYSTEM,
+    SYNTHESIS_USER_TEMPLATE,
+    SYSTEM_TEMPLATE,
+    render_template,
+    validate_insight_prompt_schema,
+)
+from backend.run_validate import validate_spec  # noqa: E402
+
+KST = timezone(timedelta(hours=9))
+PERSONA_DIR = PROJECT_ROOT / "data" / "personas"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
+# 페르소나 province(단축) ↔ GeoJSON name(풀) 매핑.
+# Nemotron 데이터에 "전북"·"전라남"·"경상남" 같은 단축·풀 형태가 섞여 있어
+# 양쪽을 모두 GeoJSON 풀 이름에 흡수.
+PROVINCE_TO_GEO: Dict[str, str] = {
+    "서울": "서울특별시",
+    "부산": "부산광역시",
+    "대구": "대구광역시",
+    "인천": "인천광역시",
+    "광주": "광주광역시",
+    "대전": "대전광역시",
+    "울산": "울산광역시",
+    "세종": "세종특별자치시",
+    "경기": "경기도",
+    "강원": "강원도",
+    "충청북": "충청북도",
+    "충청남": "충청남도",
+    "전북":   "전라북도",
+    "전라북": "전라북도",
+    "전남":   "전라남도",
+    "전라남": "전라남도",
+    "경상북": "경상북도",
+    "경상남": "경상남도",
+    "제주":   "제주특별자치도",
+}
+
+AGE_BUCKET_ORDER: List[str] = ["~19", "20대", "30대", "40대", "50대", "60+"]
+
+# ─────────────────────────────────────────────────────────
+# 보고서 생성 — gateway.py와 동일한 톤·구조 (큐레이터 비평가)
+# ─────────────────────────────────────────────────────────
+
+MODEL_LABELS: Dict[str, str] = {
+    "openrouter/qwen/qwen3-max":               "Qwen3 Max (Alibaba)",
+    "openrouter/nousresearch/hermes-4-405b":   "Hermes 4 405B (NousResearch)",
+    "openrouter/anthropic/claude-haiku-4.5":   "Claude Haiku 4.5 (Anthropic)",
+    "openrouter/nousresearch/hermes-4-70b":    "Hermes 4 70B (NousResearch)",
+    "openrouter/qwen/qwen3.6-max-preview":     "Qwen3.6 Max Preview (Alibaba)",
+    "openrouter/qwen/qwen3.6-plus":            "Qwen3.6 Plus (Alibaba)",
+    "openrouter/mistralai/mistral-large-2512": "Mistral Large (Mistral, 프랑스)",
+    "openrouter/anthropic/claude-sonnet-4.6":  "Claude Sonnet 4.6 (Anthropic)",
+    "openrouter/openai/gpt-4o-mini":           "GPT-4o mini (OpenAI)",
+    "openrouter/google/gemini-2.5-flash":      "Gemini 2.5 Flash (Google)",
+    "openrouter/deepseek/deepseek-v4-flash":   "DeepSeek v4 Flash (DeepSeek)",
+    "openrouter/x-ai/grok-4-fast":             "Grok 4 Fast (xAI)",
+    "openrouter/cohere/command-a":             "Cohere Command A (Cohere)",
+    "openrouter/anthropic/claude-opus-4.7":    "Claude Opus 4.7 (Anthropic)",
+    "openrouter/cognitivecomputations/dolphin-mistral-24b-venice-edition:free":
+                                                "Dolphin Mistral 24B (Cognitive Computations, uncensored)",
+}
+
+
+def model_label(model_id: str) -> str:
+    return MODEL_LABELS.get(model_id, model_id)
+
+
+DYNAMIC_USER_TEMPLATE = textwrap.dedent("""\
+[배경]
+{context}
+
+[질문]
+{questions}
+
+응답은 JSON 한 개로만 답해주세요. 다른 설명·인사·서두 없이 JSON만.
+
+아래 [응답 형식 정의]는 각 키가 요구하는 응답 타입·범위를 알려주는 안내입니다.
+응답 형식 정의 자체를 그대로 복사해 답하지 마세요.
+각 키에 schema가 요구하는 **실제 응답값**(정수·옵션 문자열·자유 서술 등)만
+값으로 담아 [응답 예시] 형태로 답하세요.
+
+[응답 형식 정의]
+{schema}
+
+[응답 예시 — 정확히 이 모양으로 답하세요]
+{example}
+""")
+
+
+def build_response_example(schema_block: str) -> str:
+    """schema_block(JSON)에서 LLM에 보여줄 응답 예시 JSON을 자동 생성.
+
+    각 키의 값은 placeholder 문자열로 채워지며, LLM이 placeholder를 그대로
+    복사하지 않도록 "<...>" 꺾쇠 기호로 감싼다. type/scale/options 정보를
+    placeholder 텍스트에 함께 노출해 LLM이 정확한 응답값을 생성하도록 유도.
+    """
+    try:
+        schema = json.loads(schema_block) if schema_block else {}
+    except json.JSONDecodeError:
+        return "{}"
+    if not isinstance(schema, dict):
+        return "{}"
+
+    example: Dict[str, Any] = {}
+    for key, defn in schema.items():
+        if not isinstance(defn, dict):
+            example[key] = "<응답값>"
+            continue
+        t = defn.get("type", "string")
+        opts = defn.get("options") or defn.get("enum") or []
+        scale = defn.get("scale", "")
+        if t == "integer":
+            placeholder = f"<정수 — {scale}>" if scale else "<정수>"
+            example[key] = placeholder
+        elif opts:
+            opts_str = " / ".join(str(o) for o in opts)
+            example[key] = f"<다음 중 하나: {opts_str}>"
+        else:
+            min_len = defn.get("min_length")
+            max_len = defn.get("max_length")
+            if min_len or max_len:
+                example[key] = f"<자유 서술 ({min_len or 0}~{max_len or '제한 없음'}자)>"
+            else:
+                example[key] = "<자유 서술>"
+    return json.dumps(example, ensure_ascii=False, indent=2)
+
+REPORT_SYSTEM = textwrap.dedent("""당신은 박물관·문화 분야 큐레이터를 옆에서 돕는 비평가입니다.
+큐레이터는 합성 페르소나·다중 LLM의 응답을 통해, **자기가 미처 떠올리지 못한
+관점·가설**을 발견하고 싶어합니다.
+
+중요: **본 응답은 보고서의 "해석·인사이트" 부분만 담당합니다.** 측정 개요,
+페르소나 분포, 응답자 속성 축별 분포 표, 원본 질문·스키마·명세는 별도 코드에서
+결정론적으로 생성되어 본 응답의 앞뒤에 자동으로 붙습니다. 따라서 본 응답에서는
+통계 표를 다시 그릴 필요 없고, 아래 네 섹션만 작성해 주세요. 부록·통계 표는
+만들지 마세요 — 코드가 만듭니다.
+
+다음 원칙을 지키세요:
+- 합성 페르소나의 응답은 여론조사가 아닙니다. 단언하지 말고
+  "이 모델·이 표본에서는 …" 같이 한정해 말씀해 주세요.
+- 영어 시스템 용어를 사용하지 마세요. 'demographic', 'segment', 'sample',
+  'cohort' 같은 영어 단어 대신 '응답자 속성', '응답자 그룹', '표본'처럼
+  우리말로 표현해 주세요. ('페르소나', '모델', '시뮬레이션'은 우리말로
+  굳어진 외래어이므로 사용 가능합니다.)
+- "핵심 발견" 표의 첫 번째 열(발견 라벨)에는 분석 결론·해석·수치를 적지
+  마세요. 중립적인 차원 이름만 적습니다. 예시:
+    · 권장: "01. 전체 응답 분포"
+    · 금지: "01. 호감도는 5점 만점에 평균 2.78점"
+    · 권장: "02. 학력별 격차"
+    · 금지: "02. 학력에 따른 호감도 격차가 가장 큰 신호"
+  분석 결론·수치는 두 번째 "내용" 열에 적습니다.
+- 추상적 관점 진술("관람객은 다양하게 반응했다")은 피하세요. 대신
+  큐레이터가 바로 사용할 수 있는 구체적 형태로 제시해 주세요. 예시:
+  · SNS 마케팅 카피의 톤·문구 (대상 응답자 그룹 명시)
+  · 홍보 포스터·메인 비주얼에서 강조할 지점
+  · 큐레이션 동선·섹션 배치 방향
+  · 도슨트 소개에서 강조할 부분
+  · 전시 개막식·교육 프로그램의 주제어
+- 모델 균질화·사회적 바람직성 편향 가능성을 한 줄 언급해 주세요.
+- 응답수가 작은 응답자 그룹별 분석은 "N이 작아 신호로 보기 어렵다"고
+  명시해 주세요.
+- 각 페르소나는 명시적인 속성(거주지·연령대·성별·학력·혼인 상태·직업)을
+  이미 가지고 있고, 본 자료의 응답 샘플에 그 속성이 함께 적혀 있습니다.
+  따라서 응답 본문 텍스트만 보고 "고령 추정", "중산층 추정", "지방민으로
+  보임" 같이 짐작·추정하는 표기는 사용하지 마세요. 정확한 속성이 자료에
+  있으므로 그대로 인용하시면 됩니다.
+- 응답을 직접 인용할 때는 모델명과 함께 페르소나 속성을 그대로 적어 주세요.
+  예시: "(Hermes 4 405B · 60대 여성 · 전라남도 · 고졸)"
+- 리커트 응답코드(1, 2, 3, 4, 5)는 "점수"가 아니라 응답을 수치화한 코드입니다.
+  "1점/5점" 같은 표기는 5점이 더 좋은 것처럼 가치 판단을 시사하므로 피해
+  주세요. "Q1 평균 2.28(5점 척도, 1=매우 반대)" 또는 "Q1=2가 41건"처럼
+  코드 의미를 함께 전달하거나 숫자만 사용해 주세요.
+""")
+
+
+REPORT_USER_TEMPLATE = textwrap.dedent("""아래는 이번 측정의 결정론적 팩트 자료입니다. 이 팩트를 그대로 다시 표로
+그려 답하지 마세요 — 코드가 본 응답 위아래에 측정 개요·축별 분포·부록을
+자동으로 붙입니다. 본 응답에는 **해석·가설·인사이트**만 담아 주세요.
+
+## 측정 주제
+{topic}
+
+## LLM에 주입한 컨텍스트
+{context}
+
+## 질문
+{questions}
+
+## 표본 페르소나 응답자 속성 분포 (N={n_personas})
+{persona_dist}
+
+## 모델별 응답 통계 (성공 응답만)
+{stats}
+
+{samples_block}
+
+---
+
+위 자료를 바탕으로 **다음 네 섹션만** 마크다운으로 작성해 주세요.
+섹션 헤더는 반드시 아래 네 가지를 그대로 사용하세요(번호 없이).
+부록·통계 표·축별 분포 표는 절대 만들지 마세요.
+
+## 핵심 발견
+표 형식. 첫 번째 열(발견 라벨)은 중립적인 차원 이름만 적고, 분석 결론·수치는
+두 번째 "내용" 열에 적습니다. 5~8개 행 권장.
+
+| 발견 | 내용 |
+|---|---|
+| 01. 전체 응답 분포 | (수치 + 해석) |
+| 02. (차원 이름) | … |
+| … | … |
+
+## 큐레이터 관점·가설
+3~5개. SNS 카피, 홍보 포스터 강조점, 큐레이션 방향, 도슨트 톤, 교육 프로그램
+주제어 등 큐레이터가 바로 적용 가능한 형태로 제시. 대상 응답자 그룹도 함께
+명시해 주세요.
+
+## 곱씹을 만한 응답
+2~3개. 특이하거나 큐레이터가 곱씹어볼 만한 응답을 raw 텍스트와 함께 인용.
+어떤 모델·어떤 응답자 속성의 응답인지 같이 적어 주세요.
+
+## 다음에 던져볼 질문·가설
+3~5개. 이 측정이 답한 것이 아니라 새로 떠올리게 한 질문.
+""")
+
+
+
+# ─────────────────────────────────────────────────────────
+# SIGTERM 핸들러 — 큐레이터가 [측정 취소] 누르면 systemctl stop이 보내옴
+# ─────────────────────────────────────────────────────────
+CANCEL = False
+
+
+def _handle_sigterm(signum, frame):
+    global CANCEL
+    CANCEL = True
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigterm)
+
+
+# ─────────────────────────────────────────────────────────
+# status.json — partial read 방지 위해 tmp + os.replace
+# ─────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(KST).isoformat()
+
+
+def write_status(run_dir: Path, status: Dict[str, Any]) -> None:
+    status["updated_at"] = _now_iso()
+    tmp = run_dir / "status.json.tmp"
+    tmp.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, run_dir / "status.json")
+
+
+# ─────────────────────────────────────────────────────────
+# 코드 생성 보고서 섹션 (결정론적 — LLM 호출 없음)
+# ─────────────────────────────────────────────────────────
+
+# 수도권/비수도권 binary axis
+SUDOGWON_PROVINCES = {"서울특별시", "서울", "경기도", "경기", "인천광역시", "인천"}
+
+
+def province_to_region(p: Any) -> str:
+    """거주 시도 → 수도권/비수도권 binary."""
+    return "수도권" if str(p).strip() in SUDOGWON_PROVINCES else "비수도권"
+
+
+def parse_questions_text(qtext: str) -> Dict[int, str]:
+    """'1) ...\\n2) ...' 형식을 {1: '...', 2: '...'}로 변환."""
+    out: Dict[int, str] = {}
+    if not qtext:
+        return out
+    for m in re.finditer(
+        r"^(\d+)\)\s*(.+?)(?=^\d+\)|\Z)",
+        qtext, re.MULTILINE | re.DOTALL,
+    ):
+        text = m.group(2).strip().splitlines()[0].strip()
+        out[int(m.group(1))] = text
+    return out
+
+
+def _topic_short(topic: str, limit: int = 60) -> str:
+    """긴 주제는 limit자에서 자르고 …을 붙임."""
+    if not topic:
+        return ""
+    first_line = topic.strip().splitlines()[0].strip()
+    if len(first_line) > limit:
+        return first_line[:limit] + "…"
+    return first_line
+
+
+def _format_kst_date(created_at: str, with_time: bool = False) -> str:
+    """spec.created_at(ISO) → KST 날짜 (또는 날짜+시간)."""
+    if not created_at:
+        return ""
+    try:
+        s = created_at.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            # spec.created_at에 timezone 정보 없는 경우 KST로 가정
+            dt = dt.replace(tzinfo=KST)
+        kst_dt = dt.astimezone(KST)
+        return kst_dt.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
+    except Exception:
+        return created_at[:16].replace("T", " ") if with_time else created_at[:10]
+
+
+def compose_header(
+    spec: Dict[str, Any],
+    n_personas: int,
+    n_models: int,
+    n_responses: int,
+) -> str:
+    """보고서 제목 + 시나리오 메타 + 도입 한 줄 캡션."""
+    lines: List[str] = []
+    topic_short = _topic_short(spec.get("topic", ""), limit=60)
+    date_str = _format_kst_date(spec.get("created_at", ""), with_time=False)
+
+    lines.append("# knowing-koreans · 시뮬레이션 분석 보고서")
+    lines.append("")
+    if topic_short:
+        lines.append(f"**시나리오**: {topic_short}")
+    if date_str:
+        lines.append(f"**측정일**: {date_str}")
+    lines.append(f"**규모**: AI 페르소나 {n_personas}명 × {n_models}개 모델 → 응답 {n_responses}건")
+    lines.append("")
+    lines.append(
+        "본 보고서는 응답자 속성(연령·학력·지역·성별·혼인 등)을 분류 축으로 "
+        "작성되었습니다. AI 응답을 정확도 예측이 아니라 \"어떤 응답자 그룹이 "
+        "어떤 측면에 반응하는가\"의 관점·가설 발생 도구로 활용해 주세요."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# 인포그래픽 — 보고서 종합서술 영역에 임베드되는 PNG 차트 3종
+#   (1) 호감도 막대 + 방문 의향
+#   (2) 연령대 × 성별 피라미드
+#   (3) 한국 시·도 단위 페르소나 분포 choropleth
+# matplotlib만 사용 — geopandas/shapely 의존성 회피.
+# ─────────────────────────────────────────────────────────
+
+def _setup_korean_font() -> Optional[str]:
+    """matplotlib에 한국어 폰트 설정. 시스템에 설치된 Noto/Nanum 계열 자동 탐지."""
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")
+    import matplotlib.font_manager as fm  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
+
+    candidates = (
+        "Noto Sans CJK KR", "Noto Sans KR",
+        "NanumGothic", "Nanum Gothic",
+        "Malgun Gothic", "AppleGothic",
+        # Debian/Ubuntu .ttc는 default subfamily(JP)만 인덱스되지만
+        # KR 글리프도 같은 파일에 들어 있어 'JP' 이름으로도 한글 렌더 가능
+        "Noto Sans CJK JP",
+    )
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            plt.rcParams["font.family"] = name
+            plt.rcParams["axes.unicode_minus"] = False
+            return name
+    # 부분 매칭 fallback
+    for f in fm.fontManager.ttflist:
+        if "CJK" in f.name:
+            plt.rcParams["font.family"] = f.name
+            plt.rcParams["axes.unicode_minus"] = False
+            return f.name
+    plt.rcParams["axes.unicode_minus"] = False
+    return None
+
+
+def render_appeal_chart(df_result: pd.DataFrame, png_path: Path) -> bool:
+    """호감도(1~5) + 방문 의향(yes/maybe/no) 가로 정렬 막대.
+
+    resp_appeal_score / resp_visit_intent 컬럼이 둘 다 없으면 그리지 않음.
+    """
+    appeal_col = "resp_appeal_score"
+    visit_col = "resp_visit_intent"
+    has_appeal = appeal_col in df_result.columns
+    has_visit = visit_col in df_result.columns
+    if not (has_appeal or has_visit):
+        return False
+
+    import matplotlib.pyplot as plt  # type: ignore
+
+    panels = sum([has_appeal, has_visit])
+    fig, axes = plt.subplots(1, panels, figsize=(5 * panels, 4))
+    if panels == 1:
+        axes = [axes]
+
+    idx = 0
+    if has_appeal:
+        ax = axes[idx]; idx += 1
+        appeal = pd.to_numeric(df_result[appeal_col], errors="coerce").dropna().astype(int)
+        counts = {k: int((appeal == k).sum()) for k in range(1, 6)}
+        keys = list(counts.keys())
+        vals = [counts[k] for k in keys]
+        bars = ax.bar([str(k) for k in keys], vals, color="#4a7ab8")
+        ax.set_title("호감도 분포 (1~5점)")
+        ax.set_xlabel("점수")
+        ax.set_ylabel("응답 수")
+        for b, v in zip(bars, vals):
+            if v > 0:
+                ax.text(b.get_x() + b.get_width() / 2, v, str(v),
+                        ha="center", va="bottom", fontsize=9)
+
+    if has_visit:
+        ax = axes[idx]; idx += 1
+        visit = df_result[visit_col].astype(str).str.strip().str.lower()
+        order = [("yes", "방문하겠다"), ("maybe", "글쎄/조건부"), ("no", "안 가겠다")]
+        vals = [int((visit == k).sum()) for k, _ in order]
+        labels = [lab for _, lab in order]
+        colors = ["#4caf50", "#ffb300", "#e53935"]
+        bars = ax.bar(labels, vals, color=colors)
+        ax.set_title("방문 의향")
+        ax.set_ylabel("응답 수")
+        for b, v in zip(bars, vals):
+            if v > 0:
+                ax.text(b.get_x() + b.get_width() / 2, v, str(v),
+                        ha="center", va="bottom", fontsize=9)
+
+    plt.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def render_age_pyramid(df_personas: pd.DataFrame, png_path: Path) -> bool:
+    """페르소나 연령대 × 성별 피라미드 (좌 남자 / 우 여자)."""
+    if "age_bucket" not in df_personas.columns or "sex" not in df_personas.columns:
+        return False
+
+    import matplotlib.pyplot as plt  # type: ignore
+    import numpy as np  # type: ignore
+
+    male = []
+    female = []
+    for age in AGE_BUCKET_ORDER:
+        mask = df_personas["age_bucket"].astype(str) == age
+        male.append(int(((df_personas["sex"].astype(str) == "남자") & mask).sum()))
+        female.append(int(((df_personas["sex"].astype(str) == "여자") & mask).sum()))
+
+    if sum(male) + sum(female) == 0:
+        return False
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    y = np.arange(len(AGE_BUCKET_ORDER))
+    ax.barh(y, [-m for m in male], height=0.7, color="#5b8def", label="남자")
+    ax.barh(y, female, height=0.7, color="#ef7c8e", label="여자")
+    for yi, (m, f) in enumerate(zip(male, female)):
+        if m > 0:
+            ax.text(-m - 1, yi, str(m), va="center", ha="right", fontsize=9)
+        if f > 0:
+            ax.text(f + 1, yi, str(f), va="center", ha="left", fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(AGE_BUCKET_ORDER)
+    ax.set_xlabel("페르소나 수")
+    ax.set_title("페르소나 연령대 × 성별 분포")
+    xticks = ax.get_xticks()
+    ax.set_xticklabels([str(abs(int(x))) for x in xticks])
+    ax.legend(loc="lower right")
+    ax.axvline(0, color="black", linewidth=0.5)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def render_korea_map(df_personas: pd.DataFrame, png_path: Path) -> bool:
+    """한국 17개 시·도 단위 페르소나 분포 choropleth.
+
+    geopandas/shapely 의존 없이 GeoJSON을 json으로 직접 파싱하고
+    matplotlib Polygon patch로 그림. 시·도 이름은 PROVINCE_TO_GEO로 매핑.
+    """
+    if "province" not in df_personas.columns:
+        return False
+    geo_path = ASSETS_DIR / "skorea-provinces-2018-geo.json"
+    if not geo_path.exists():
+        return False
+
+    import json as _json
+    import matplotlib.pyplot as plt  # type: ignore
+    from matplotlib.patches import Polygon as MplPolygon  # type: ignore
+    from matplotlib.collections import PatchCollection  # type: ignore
+    from matplotlib.colors import Normalize  # type: ignore
+    from matplotlib import cm  # type: ignore
+
+    counts_by_geo: Dict[str, int] = {}
+    vc = df_personas["province"].astype(str).value_counts()
+    for prov, cnt in vc.items():
+        geo_name = PROVINCE_TO_GEO.get(str(prov))
+        if geo_name:
+            counts_by_geo[geo_name] = counts_by_geo.get(geo_name, 0) + int(cnt)
+
+    if not counts_by_geo:
+        return False
+
+    geo = _json.loads(geo_path.read_text(encoding="utf-8"))
+    fig, ax = plt.subplots(figsize=(7.5, 8))
+    cmap = cm.get_cmap("YlOrRd")
+    max_cnt = max(counts_by_geo.values()) or 1
+    norm = Normalize(vmin=0, vmax=max_cnt)
+
+    def _ring_xy(ring):
+        xs = [pt[0] for pt in ring]
+        ys = [pt[1] for pt in ring]
+        return xs, ys
+
+    for ft in geo.get("features", []):
+        name = ft.get("properties", {}).get("name", "")
+        cnt = counts_by_geo.get(name, 0)
+        color = cmap(norm(cnt))
+        geom = ft.get("geometry", {})
+        gtype = geom.get("type", "")
+        coords = geom.get("coordinates", [])
+        polys: list = []
+        if gtype == "Polygon":
+            polys = [coords]
+        elif gtype == "MultiPolygon":
+            polys = coords
+        else:
+            continue
+
+        patches = []
+        biggest_ring = None
+        biggest_area = -1.0
+        for poly in polys:
+            if not poly:
+                continue
+            outer = poly[0]
+            patches.append(MplPolygon(outer, closed=True))
+            xs, ys = _ring_xy(outer)
+            x_extent = (max(xs) - min(xs)) if xs else 0
+            y_extent = (max(ys) - min(ys)) if ys else 0
+            area_proxy = x_extent * y_extent
+            if area_proxy > biggest_area:
+                biggest_area = area_proxy
+                biggest_ring = outer
+
+        if patches:
+            pc = PatchCollection(patches, facecolor=color, edgecolor="white", linewidths=0.6)
+            ax.add_collection(pc)
+
+        if biggest_ring is not None:
+            xs, ys = _ring_xy(biggest_ring)
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            short = (
+                name.replace("특별자치도", "")
+                    .replace("특별자치시", "")
+                    .replace("특별시", "")
+                    .replace("광역시", "")
+                    .replace("도", "")
+            )
+            label = f"{short}\n{cnt}" if cnt > 0 else short
+            alpha = 1.0 if cnt > 0 else 0.5
+            ax.text(cx, cy, label, ha="center", va="center",
+                    fontsize=8, alpha=alpha)
+
+    ax.set_aspect("equal")
+    ax.set_xlim(124.5, 132.0)
+    ax.set_ylim(33.0, 39.0)
+    ax.axis("off")
+    total_n = sum(counts_by_geo.values())
+    ax.set_title(f"페르소나 거주지 분포 (시·도, 총 {total_n}명)")
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.6)
+    cbar.set_label("페르소나 수")
+    plt.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+# ─────────────────────────────────────────────────────────
+# 응답 결과 시각화 — 시나리오 무관 자동 검출 패턴
+# 보고서 종합서술 영역에 임베드되는 차트 3종:
+#   D. 응답 항목별 분포 막대 (numeric/categorical 자동 grid)
+#   E. 핵심 응답 × axis(연령대·성별·거주권역) 교차
+#   F. 핵심 응답 × 모델 비교
+# spec.schema_block 자동 파싱 — 응답 schema 변해도 동작.
+# ─────────────────────────────────────────────────────────
+
+def _detect_response_columns(
+    spec: Dict[str, Any],
+    df_result: pd.DataFrame,
+) -> Dict[str, Dict[str, Any]]:
+    """spec.schema_block + df_result 컬럼 교차해 응답 컬럼 메타 추출.
+
+    반환: {"resp_<key>": {q_key, type_class, options, scale_range, description}}
+      type_class: "numeric" | "categorical" | "freetext"
+    """
+    schema_block = spec.get("schema_block", "")
+    try:
+        schema = json.loads(schema_block) if isinstance(schema_block, str) else schema_block
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(schema, dict):
+        return {}
+
+    detected: Dict[str, Dict[str, Any]] = {}
+    for q_key, q_def in schema.items():
+        col = f"resp_{q_key}"
+        if col not in df_result.columns or not isinstance(q_def, dict):
+            continue
+        t = q_def.get("type", "")
+        options = q_def.get("options") or q_def.get("enum")
+        scale = q_def.get("scale", "")
+        min_length = q_def.get("min_length")
+        desc = q_def.get("description", "") or ""
+
+        if t == "integer" or "Likert" in str(scale) or "likert" in str(scale).lower():
+            type_class = "numeric"
+            scale_range = (1, 5)
+            m = re.search(r"(\d+)\s*[-~]\s*(\d+)", str(scale))
+            if m:
+                scale_range = (int(m.group(1)), int(m.group(2)))
+        elif options and isinstance(options, list) and len(options) > 0:
+            type_class = "categorical"
+            scale_range = None
+        elif t == "string" and (min_length or "자유" in desc or "서술" in desc):
+            type_class = "freetext"
+            scale_range = None
+        else:
+            type_class = "categorical" if options else "freetext"
+            scale_range = None
+
+        likert_labels = _likert_labels_from_scale(scale) if type_class == "numeric" else None
+
+        detected[col] = {
+            "q_key": q_key,
+            "type_class": type_class,
+            "options": options if isinstance(options, list) else None,
+            "scale_range": scale_range,
+            "description": desc,
+            "scale_text": str(scale) if scale else "",
+            "likert_labels": likert_labels,
+        }
+    return detected
+
+
+def _select_primary_response_col(
+    spec: Dict[str, Any],
+    detected: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    """E·F 차트의 핵심 응답 컬럼 자동 선택.
+
+    우선순위: spec["primary_outcome_col"] → 첫 numeric → 첫 categorical → None.
+    """
+    primary = spec.get("primary_outcome_col")
+    if primary and primary in detected:
+        return primary
+    for col, meta in detected.items():
+        if meta["type_class"] == "numeric":
+            return col
+    for col, meta in detected.items():
+        if meta["type_class"] == "categorical":
+            return col
+    return None
+
+
+def _likert_labels_from_scale(scale: Any) -> Optional[List[str]]:
+    """schema의 scale 문구 → 5점 Likert 한글 라벨 list.
+
+    1) 흔한 한국어 Likert 5종 (찬반·동의·만족·중요·빈도) 패턴 매칭 — 매칭되면 5점 모두 한글
+    2) 매칭 실패 시 정규식으로 '1=...', '3=...', '5=...' 추출 — 1·3·5만 한글, 2·4는 숫자
+    3) 둘 다 실패 → None (호출부에서 숫자 사용)
+    """
+    if not isinstance(scale, str) or not scale.strip():
+        return None
+    s = scale
+
+    if "반대" in s and "찬성" in s:
+        return ["매우\n반대", "반대", "중립", "찬성", "매우\n찬성"]
+    if "그렇지" in s and "그렇다" in s:
+        return ["전혀\n아니다", "아니다", "보통", "그렇다", "매우\n그렇다"]
+    if "만족" in s and ("불만" in s or "매우" in s):
+        return ["매우\n불만족", "불만족", "보통", "만족", "매우\n만족"]
+    if "중요" in s and ("않" in s or "전혀" in s):
+        return ["전혀\n중요\nX", "중요\n낮음", "보통", "중요", "매우\n중요"]
+    if ("빈도" in s or "자주" in s) and ("없" in s or "않" in s):
+        return ["전혀\n없음", "거의\n없음", "가끔", "자주", "매우\n자주"]
+
+    matches = dict(re.findall(r"(\d)\s*=\s*([^,)]+?)(?=\s*[,)]|$)", s))
+    if "1" in matches and "5" in matches:
+        def _short(t: str, n: int = 10) -> str:
+            t = t.strip().rstrip(".")
+            return t if len(t) <= n else t[:n] + "…"
+        l1 = _short(matches["1"])
+        l5 = _short(matches["5"])
+        l3 = _short(matches.get("3", "")) if matches.get("3", "").strip() else "3"
+        return [l1, "2", l3, "4", l5]
+
+    return None
+
+
+def _classify_urban(province: Any) -> str:
+    """페르소나 province → 도시규모 3분류 (단축형/풀형 둘 다 흡수)."""
+    if not isinstance(province, str):
+        return "그 외"
+    if province in ("서울", "서울특별시", "경기", "경기도", "인천", "인천광역시"):
+        return "수도권"
+    if province in (
+        "부산", "부산광역시", "대구", "대구광역시", "광주", "광주광역시",
+        "대전", "대전광역시", "울산", "울산광역시",
+    ):
+        return "광역시"
+    return "그 외"
+
+
+def render_response_distribution(
+    df_result: pd.DataFrame,
+    response_schema: Dict[str, Dict[str, Any]],
+    png_path: Path,
+) -> bool:
+    """D. 응답 항목별 분포 막대 — numeric은 점수 빈도, categorical은 옵션별 빈도."""
+    plot_cols = [
+        (c, m) for c, m in response_schema.items()
+        if m["type_class"] in ("numeric", "categorical")
+    ]
+    if not plot_cols:
+        return False
+
+    import matplotlib.pyplot as plt  # type: ignore
+
+    n = len(plot_cols)
+    if n == 1:
+        rows, cols = 1, 1
+    elif n <= 2:
+        rows, cols = 1, 2
+    elif n <= 4:
+        rows, cols = 2, 2
+    elif n <= 6:
+        rows, cols = 2, 3
+    elif n <= 9:
+        rows, cols = 3, 3
+    else:
+        rows, cols = 3, 4
+
+    fig, axes_obj = plt.subplots(rows, cols, figsize=(5 * cols, 3.5 * rows))
+    if rows * cols == 1:
+        axes = [axes_obj]
+    else:
+        axes = list(axes_obj.ravel())
+
+    for idx, (col, meta) in enumerate(plot_cols):
+        ax = axes[idx]
+        s = df_result[col].dropna()
+        title = (meta.get("description") or meta["q_key"])[:48]
+
+        if s.empty:
+            ax.text(0.5, 0.5, "데이터 없음", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(title, fontsize=11)
+            continue
+
+        if meta["type_class"] == "numeric":
+            scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
+            s_int = pd.to_numeric(s, errors="coerce").dropna().round().astype(int)
+            xs = list(range(scale_lo, scale_hi + 1))
+            ys = [int((s_int == k).sum()) for k in xs]
+            mean_v = float(s_int.mean()) if len(s_int) else 0.0
+            ax.bar(xs, ys, color="#5b8def", edgecolor="white")
+            ax.set_xticks(xs)
+            likert = meta.get("likert_labels")
+            if likert and len(likert) == (scale_hi - scale_lo + 1):
+                ax.set_xticklabels(likert, fontsize=8)
+            ax.set_xlabel(f"{meta['q_key']} (평균 {mean_v:.2f})", fontsize=9)
+            ax.set_ylabel("응답 수", fontsize=9)
+            for x, y in zip(xs, ys):
+                if y > 0:
+                    ax.text(x, y, str(y), ha="center", va="bottom", fontsize=8)
+        else:
+            options = meta.get("options") or sorted([str(v) for v in s.unique()])
+            counts = {opt: int((s.astype(str) == str(opt)).sum()) for opt in options}
+            labels = [str(opt)[:18] for opt in counts.keys()]
+            ys = list(counts.values())
+            ax.barh(range(len(labels)), ys, color="#ef7c8e", edgecolor="white")
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=9)
+            ax.invert_yaxis()
+            ax.set_xlabel("응답 수", fontsize=9)
+            for i, y in enumerate(ys):
+                if y > 0:
+                    ax.text(y, i, f" {y}", va="center", fontsize=8)
+
+        ax.set_title(title, fontsize=10)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for idx in range(len(plot_cols), len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle("응답 항목별 분포", fontsize=13, y=0.995)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def render_response_by_axis(
+    df_personas: pd.DataFrame,
+    df_result: pd.DataFrame,
+    response_schema: Dict[str, Dict[str, Any]],
+    primary_col: str,
+    png_path: Path,
+) -> bool:
+    """E. 핵심 응답 × axis 교차 — 연령대·성별·거주권역 3 panel."""
+    if primary_col not in response_schema or primary_col not in df_result.columns:
+        return False
+    if "persona_uuid" not in df_result.columns or "persona_uuid" not in df_personas.columns:
+        return False
+
+    import matplotlib.pyplot as plt  # type: ignore
+
+    meta = response_schema[primary_col]
+    type_class = meta["type_class"]
+
+    keep_cols = ["persona_uuid"]
+    for c in ("age_bucket", "sex", "province"):
+        if c in df_personas.columns:
+            keep_cols.append(c)
+    df_p = df_personas[keep_cols].copy()
+    if "province" in df_p.columns:
+        df_p["urban_class"] = df_p["province"].map(_classify_urban)
+        df_p = df_p.drop(columns=["province"])
+
+    df = df_result.merge(df_p, on="persona_uuid", how="left")
+
+    axis_specs: List[Tuple[str, str, List[str]]] = []
+    if "age_bucket" in df.columns:
+        axis_specs.append(("age_bucket", "연령대", AGE_BUCKET_ORDER))
+    if "sex" in df.columns:
+        sex_order = ["male", "female"]
+        sex_label_map = {"male": "남자", "female": "여자"}
+        axis_specs.append(("sex", "성별", sex_order))
+    else:
+        sex_label_map = {}
+    if "urban_class" in df.columns:
+        axis_specs.append(("urban_class", "거주 권역", ["수도권", "광역시", "그 외"]))
+
+    if not axis_specs:
+        return False
+
+    n = len(axis_specs)
+    if n <= 2:
+        rows, cols = 1, n
+    elif n <= 4:
+        rows, cols = 2, 2
+    else:
+        rows, cols = 2, 3
+    fig, axes_obj = plt.subplots(rows, cols, figsize=(5 * cols, 4.2 * rows))
+    if rows * cols == 1:
+        axes = [axes_obj]
+    else:
+        axes = list(axes_obj.ravel())
+    for k in range(n, rows * cols):
+        axes[k].axis("off")
+
+    title_prefix = (meta.get("description") or meta["q_key"])[:50]
+
+    for ax, (axis_col, axis_label, axis_order) in zip(axes, axis_specs):
+        sub = df[[axis_col, primary_col]].dropna()
+        if sub.empty:
+            ax.text(0.5, 0.5, "데이터 부족", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(axis_label, fontsize=11)
+            continue
+
+        present = list(sub[axis_col].astype(str).unique())
+        groups = [g for g in axis_order if g in present] or sorted(present)
+        display_labels = [
+            sex_label_map.get(g, g) if axis_col == "sex" else str(g)
+            for g in groups
+        ]
+
+        if type_class == "numeric":
+            means: List[float] = []
+            counts: List[int] = []
+            for g in groups:
+                s = pd.to_numeric(sub[sub[axis_col].astype(str) == g][primary_col], errors="coerce").dropna()
+                means.append(float(s.mean()) if len(s) else 0.0)
+                counts.append(int(len(s)))
+            ax.bar(range(len(groups)), means, color="#5b8def", edgecolor="white")
+            ax.set_xticks(range(len(groups)))
+            ax.set_xticklabels(display_labels, rotation=15, fontsize=9)
+            ax.set_ylabel("평균 점수", fontsize=10)
+            scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
+            ax.set_ylim(scale_lo, scale_hi)
+            likert = meta.get("likert_labels")
+            if likert and len(likert) == (scale_hi - scale_lo + 1):
+                yticks = list(range(scale_lo, scale_hi + 1))
+                yticklabels = [
+                    f"{v}\n{likert[v - scale_lo].replace(chr(10), ' ')}"
+                    if v in (scale_lo, (scale_lo + scale_hi) // 2, scale_hi)
+                    else str(v)
+                    for v in yticks
+                ]
+                ax.set_yticks(yticks)
+                ax.set_yticklabels(yticklabels, fontsize=7)
+            for i, (m_v, c_v) in enumerate(zip(means, counts)):
+                ax.text(i, m_v, f"{m_v:.2f}\n(n={c_v})", ha="center", va="bottom", fontsize=8)
+        else:
+            options = meta.get("options") or sorted([str(v) for v in sub[primary_col].unique()])
+            colors = plt.cm.Set2.colors
+            bottom = [0.0] * len(groups)
+            for opt_idx, opt in enumerate(options):
+                ratios: List[float] = []
+                for g in groups:
+                    g_sub = sub[sub[axis_col].astype(str) == g]
+                    n_g = len(g_sub)
+                    if n_g == 0:
+                        ratios.append(0.0)
+                    else:
+                        ratios.append(float((g_sub[primary_col].astype(str) == str(opt)).sum()) / n_g * 100)
+                ax.bar(
+                    range(len(groups)), ratios, bottom=bottom,
+                    label=str(opt)[:14], color=colors[opt_idx % len(colors)],
+                    edgecolor="white",
+                )
+                bottom = [b + r for b, r in zip(bottom, ratios)]
+            ax.set_xticks(range(len(groups)))
+            ax.set_xticklabels(display_labels, rotation=15, fontsize=9)
+            ax.set_ylabel("비율 (%)", fontsize=10)
+            ax.set_ylim(0, 100)
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=1)
+
+        ax.set_title(axis_label, fontsize=11)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle(f"{title_prefix} — 인구학적 axis 교차", fontsize=12, y=1.0)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def render_response_by_model(
+    df_result: pd.DataFrame,
+    response_schema: Dict[str, Dict[str, Any]],
+    primary_col: str,
+    png_path: Path,
+) -> bool:
+    """F. 핵심 응답 × 모델 — numeric은 평균 막대, categorical은 stacked bar."""
+    if primary_col not in response_schema or primary_col not in df_result.columns:
+        return False
+    if "model_id" not in df_result.columns:
+        return False
+
+    import matplotlib.pyplot as plt  # type: ignore
+
+    meta = response_schema[primary_col]
+    type_class = meta["type_class"]
+
+    models = sorted([str(m) for m in df_result["model_id"].dropna().unique()])
+    if not models:
+        return False
+
+    title_prefix = (meta.get("description") or meta["q_key"])[:50]
+    fig, ax = plt.subplots(figsize=(max(7.0, len(models) * 1.5), 4.5))
+    labels = [m.rsplit("/", 1)[-1] for m in models]
+
+    if type_class == "numeric":
+        means: List[float] = []
+        counts: List[int] = []
+        for m in models:
+            s = pd.to_numeric(df_result[df_result["model_id"].astype(str) == m][primary_col], errors="coerce").dropna()
+            means.append(float(s.mean()) if len(s) else 0.0)
+            counts.append(int(len(s)))
+        ax.bar(range(len(models)), means, color="#5b8def", edgecolor="white")
+        ax.set_xticks(range(len(models)))
+        ax.set_xticklabels(labels, rotation=15, fontsize=9)
+        ax.set_ylabel("평균 점수", fontsize=10)
+        scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
+        ax.set_ylim(scale_lo, scale_hi)
+        likert = meta.get("likert_labels")
+        if likert and len(likert) == (scale_hi - scale_lo + 1):
+            yticks = list(range(scale_lo, scale_hi + 1))
+            yticklabels = [
+                f"{v}\n{likert[v - scale_lo].replace(chr(10), ' ')}"
+                if v in (scale_lo, (scale_lo + scale_hi) // 2, scale_hi)
+                else str(v)
+                for v in yticks
+            ]
+            ax.set_yticks(yticks)
+            ax.set_yticklabels(yticklabels, fontsize=8)
+        for i, (m_v, c_v) in enumerate(zip(means, counts)):
+            ax.text(i, m_v, f"{m_v:.2f}\n(n={c_v})", ha="center", va="bottom", fontsize=9)
+    else:
+        options = meta.get("options") or sorted([str(v) for v in df_result[primary_col].dropna().unique()])
+        colors = plt.cm.Set2.colors
+        bottom = [0.0] * len(models)
+        for opt_idx, opt in enumerate(options):
+            ratios: List[float] = []
+            for mod in models:
+                g_sub = df_result[df_result["model_id"].astype(str) == mod]
+                g_sub = g_sub.dropna(subset=[primary_col])
+                n_g = len(g_sub)
+                if n_g == 0:
+                    ratios.append(0.0)
+                else:
+                    ratios.append(float((g_sub[primary_col].astype(str) == str(opt)).sum()) / n_g * 100)
+            ax.bar(
+                range(len(models)), ratios, bottom=bottom,
+                label=str(opt)[:16], color=colors[opt_idx % len(colors)],
+                edgecolor="white",
+            )
+            bottom = [b + r for b, r in zip(bottom, ratios)]
+        ax.set_xticks(range(len(models)))
+        ax.set_xticklabels(labels, rotation=15, fontsize=9)
+        ax.set_ylabel("비율 (%)", fontsize=10)
+        ax.set_ylim(0, 100)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.9, ncol=1)
+
+    ax.set_title(f"{title_prefix} — 모델별 응답", fontsize=12)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def render_overview_charts(
+    df_personas: pd.DataFrame,
+    df_result: pd.DataFrame,
+    spec: Dict[str, Any],
+    run_dir: Path,
+) -> str:
+    """응답 결과 시각화 차트 3종을 PNG로 저장 후 markdown 임베드 블록 반환.
+
+    schema_block 자동 검출로 시나리오 무관 동작. 응답 컬럼·axis 정보 부족이면
+    해당 차트 skip — markdown 블록도 그만큼 줄어듦.
+    """
+    if run_dir is None:
+        return ""
+
+    try:
+        _setup_korean_font()
+    except Exception as e:
+        print(f"[warn] 한글 폰트 설정 실패: {e}", flush=True)
+
+    response_schema = _detect_response_columns(spec, df_result)
+    if not response_schema:
+        print("[warn] 응답 schema 검출 실패 — 인포그래픽 skip", flush=True)
+        return ""
+
+    primary_col = _select_primary_response_col(spec, response_schema)
+
+    blocks: List[str] = []
+
+    dist_path = run_dir / "chart_response_dist.png"
+    try:
+        if render_response_distribution(df_result, response_schema, dist_path):
+            blocks.append("![응답 항목별 분포](chart_response_dist.png)")
+    except Exception as e:
+        print(f"[warn] 응답 분포 차트 실패: {e}", flush=True)
+
+    if primary_col:
+        axis_path = run_dir / "chart_response_by_axis.png"
+        try:
+            if render_response_by_axis(df_personas, df_result, response_schema, primary_col, axis_path):
+                blocks.append("![핵심 응답 × 인구학적 axis](chart_response_by_axis.png)")
+        except Exception as e:
+            print(f"[warn] axis 교차 차트 실패: {e}", flush=True)
+
+        model_path = run_dir / "chart_response_by_model.png"
+        try:
+            if render_response_by_model(df_result, response_schema, primary_col, model_path):
+                blocks.append("![핵심 응답 × 모델](chart_response_by_model.png)")
+        except Exception as e:
+            print(f"[warn] 모델 비교 차트 실패: {e}", flush=True)
+
+    if not blocks:
+        return ""
+
+    return "\n\n".join(["**한눈에 보기 — 응답 결과 시각화**", "", *blocks, ""])
+
+
+def compose_overview(
+    spec: Dict[str, Any],
+    df_personas: pd.DataFrame,
+    df_result: pd.DataFrame,
+    run_dir: Optional[Path] = None,
+) -> str:
+    """## 측정 개요 — 측정일/시나리오/페르소나 출처/추출 방식/페르소나 수/응답수/속성 분포/질문 수."""
+    lines: List[str] = []
+    n = spec.get("n", 0)
+    seed = spec.get("seed", 42)
+    models = spec.get("models", [])
+    n_total = len(df_result)
+
+    if "ok" in df_result.columns:
+        ok_df = df_result[df_result["ok"] == True]  # noqa: E712
+    else:
+        ok_df = df_result
+    n_ok = len(ok_df)
+    success_rate = f"{n_ok / n_total * 100:.1f}%" if n_total else "0%"
+
+    date_str = _format_kst_date(spec.get("created_at", ""), with_time=True)
+    questions = spec.get("questions", "") or ""
+    q_count = len(parse_questions_text(questions))
+    topic_short = _topic_short(spec.get("topic", ""), limit=60)
+
+    lines.append("## 측정 개요")
+    lines.append("")
+    lines.append(
+        "이번 측정에 사용된 자료의 요약입니다. 응답자 속성 분포는 보고서 "
+        "본문의 축별 분포 표와 함께 읽어 주세요."
+    )
+    lines.append("")
+    lines.append("| 항목 | 내용 |")
+    lines.append("|---|---|")
+    if date_str:
+        lines.append(f"| 측정일 | {date_str} (KST) |")
+    if topic_short:
+        lines.append(f"| 시나리오 | {topic_short} |")
+    lines.append("| 페르소나 출처 | NVIDIA Nemotron-Personas-Korea (한국 인구통계 합성 페르소나) |")
+    lines.append(f"| 추출 방식 | 시드 고정 무작위 추출 (seed={seed}) |")
+    lines.append(f"| 페르소나 수 | {n}명 |")
+    lines.append(f"| 시뮬레이션 모델 수 | {len(models)}개 |")
+    lines.append(f"| 응답 수 (페르소나 × 모델) | {n_total}건 |")
+    lines.append(f"| 성공 응답 | {n_ok}건 ({success_rate}) |")
+    lines.append(f"| 질문 수 | {q_count}개 |")
+
+    # 페르소나 응답자 속성 분포 — 같은 표 안에 압축 행으로
+    if df_personas is not None and len(df_personas) > 0:
+        dist_specs = [
+            ("sex", "성별 분포"),
+            ("age_bucket", "연령대 분포"),
+            ("education_level", "학력 분포"),
+            ("marital_status", "혼인 분포"),
+        ]
+        for col, label in dist_specs:
+            if col in df_personas.columns:
+                vc = df_personas[col].astype(str).value_counts()
+                summary = ", ".join(f"{val} {cnt}명" for val, cnt in vc.items())
+                lines.append(f"| {label} | {summary} |")
+    lines.append("")
+
+    lines.append("**시뮬레이션 모델 목록:**")
+    lines.append("")
+    for m in models:
+        lines.append(f"- {model_label(m)}")
+    lines.append("")
+
+    # 인포그래픽 — 측정 개요 표 + 모델 목록 직후, 본격 본문 진입 전
+    if run_dir is not None:
+        try:
+            charts_md = render_overview_charts(df_personas, df_result, spec, run_dir)
+            if charts_md:
+                lines.append(charts_md)
+        except Exception as e:
+            print(f"[warn] 인포그래픽 임베드 실패: {e}", flush=True)
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# 응답자 속성 축별 분포 — 질문별 6개 축
+# ─────────────────────────────────────────────────────────
+AXIS_DEFS: List[Tuple[str, str, Optional[str]]] = [
+    ("__all__",           "전체 분포",          None),
+    ("region",            "수도권 vs 비수도권", "region"),
+    ("age_bucket",        "연령대별",           "age_bucket"),
+    ("education_level",   "학력별",             "education_level"),
+    ("sex",               "성별",               "sex"),
+    ("marital_status",    "혼인 상태별",         "marital_status"),
+]
+
+
+def compose_axis_breakdown(
+    spec: Dict[str, Any],
+    df_personas: pd.DataFrame,
+    df_result: pd.DataFrame,
+) -> str:
+    """질문별 × 응답자 속성 축별 분포 표."""
+    lines: List[str] = []
+
+    schema_block = spec.get("schema_block", "") or "{}"
+    try:
+        schema = json.loads(schema_block)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(schema, dict):
+        return ""
+
+    if "ok" in df_result.columns:
+        df_ok = df_result[df_result["ok"] == True].copy()  # noqa: E712
+    else:
+        df_ok = df_result.copy()
+
+    lines.append("## 응답 — 응답자 속성 축별 분포")
+    lines.append("")
+    lines.append(
+        "각 질문에 대해 응답자 속성 축(전체·수도권/비수도권·연령대·학력·성별·"
+        "혼인 상태)별로 응답이 어떻게 갈리는지 정리한 표입니다. 표본이 작은 "
+        "그룹은 신호로 보기 어려우니 함께 표시되는 응답수를 같이 봐 주세요."
+    )
+    lines.append("")
+
+    if len(df_ok) == 0 or df_personas is None or len(df_personas) == 0:
+        lines.append("_(성공 응답이 없어 축별 분포를 생략합니다.)_")
+        lines.append("")
+        return "\n".join(lines)
+
+    # 페르소나 응답자 속성 컬럼을 result에 병합
+    persona_axis_cols = [
+        "persona_uuid", "province", "age_bucket", "sex",
+        "education_level", "marital_status",
+    ]
+    avail_cols = [c for c in persona_axis_cols if c in df_personas.columns]
+    df_joined = df_ok.merge(df_personas[avail_cols], on="persona_uuid", how="left")
+    if "province" in df_joined.columns:
+        df_joined["region"] = df_joined["province"].apply(province_to_region)
+
+    q_text_map = parse_questions_text(spec.get("questions", "") or "")
+
+    for q_idx, (q_key, q_def) in enumerate(schema.items(), start=1):
+        if not isinstance(q_def, dict):
+            continue
+        q_type = q_def.get("type", "string")
+        q_scale = q_def.get("scale", "")
+        q_enum = q_def.get("enum") or q_def.get("options") or []
+
+        # 자유서술(string + description, no enum/options)은 축별 분포 대상이 아님
+        if q_type == "string" and not q_enum:
+            continue
+
+        col = f"resp_{q_key}"
+        if col not in df_joined.columns:
+            continue
+
+        # q_key의 선두 번호로 질문 텍스트 매칭
+        m = re.match(r"q(\d+)", q_key)
+        q_num = int(m.group(1)) if m else q_idx
+        q_text = q_text_map.get(q_num, q_key)
+
+        lines.append(f"## {q_num}. {q_text}")
+        lines.append("")
+        if q_scale:
+            lines.append(f"_{q_scale}_")
+            lines.append("")
+        elif q_enum:
+            lines.append(f"_옵션: {', '.join(q_enum)}_")
+            lines.append("")
+
+        for axis_key, axis_label, axis_col in AXIS_DEFS:
+            if axis_col is not None and axis_col not in df_joined.columns:
+                continue
+
+            lines.append(f"### {axis_label}")
+            lines.append("")
+
+            if axis_col is None:
+                groups: List[Tuple[str, pd.DataFrame]] = [("전체", df_joined)]
+            else:
+                unique_vals = sorted(
+                    df_joined[axis_col].dropna().astype(str).unique().tolist()
+                )
+                groups = [
+                    (g, df_joined[df_joined[axis_col].astype(str) == g])
+                    for g in unique_vals
+                ]
+
+            if q_type == "integer":
+                # 리커트 응답코드는 "점수"가 아니므로 "1점/2점" 표기를 피함.
+                # 의미는 위쪽 캡션(예: "1~5 Likert (1=매우 반대, 5=매우 찬성)")
+                # 한 군데에서만 전달. 표 헤더는 응답코드 숫자만 노출.
+                lines.append(
+                    "| 응답자 속성 | 응답수 | 평균 | 표준편차 | "
+                    "1 | 2 | 3 | 4 | 5 |"
+                )
+                lines.append(
+                    "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+                )
+                for g_val, g_df in groups:
+                    series = pd.to_numeric(g_df[col], errors="coerce").dropna()
+                    if len(series) == 0:
+                        continue
+                    counts = series.astype(int).value_counts().to_dict()
+                    cells = [counts.get(i, 0) for i in range(1, 6)]
+                    std_str = (
+                        f"{series.std():.2f}"
+                        if len(series) >= 2 and not pd.isna(series.std())
+                        else "-"
+                    )
+                    lines.append(
+                        f"| {g_val} | {len(series)} | {series.mean():.2f} | "
+                        f"{std_str} | "
+                        + " | ".join(str(c) for c in cells) + " |"
+                    )
+                lines.append("")
+
+            elif q_type == "string" and q_enum:
+                opt_labels = [str(o).replace("_", " ") for o in q_enum]
+                lines.append(
+                    "| 응답자 속성 | 응답수 | "
+                    + " | ".join(opt_labels) + " |"
+                )
+                lines.append(
+                    "|---|---:|"
+                    + "|".join(["---:"] * len(q_enum)) + "|"
+                )
+                for g_val, g_df in groups:
+                    series = g_df[col].dropna().astype(str)
+                    if len(series) == 0:
+                        continue
+                    counts = series.value_counts().to_dict()
+                    cells = [counts.get(opt, 0) for opt in q_enum]
+                    lines.append(
+                        f"| {g_val} | {len(series)} | "
+                        + " | ".join(str(c) for c in cells) + " |"
+                    )
+                lines.append("")
+
+    return "\n".join(lines)
+
+
+def split_insights(insights_md: str) -> Tuple[str, str]:
+    """LLM이 만든 4섹션을 (핵심발견+가설) / (곱씹을응답+다음질문) 둘로 분리.
+
+    분리 마커: '## 곱씹을 만한 응답'.
+    LLM이 이 헤더를 안 만들었으면 전체를 위쪽에 두고 아래쪽은 빈 문자열.
+    """
+    if not insights_md:
+        return "", ""
+    marker = "## 곱씹을 만한 응답"
+    idx = insights_md.find(marker)
+    if idx == -1:
+        return insights_md.rstrip() + "\n", ""
+    return insights_md[:idx].rstrip() + "\n", insights_md[idx:]
+
+
+def compose_appendix(
+    spec: Dict[str, Any],
+    df_personas: pd.DataFrame,
+    df_result: pd.DataFrame,
+) -> str:
+    """
+    보고서 하단 부록을 코드로 생성.
+    부록 A: 원본 질문 + 응답 스키마 + 측정 명세
+    부록 B: 상세 응답 분포 (전체 통계 재출력)
+    """
+    lines: List[str] = []
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 부록")
+    lines.append("")
+
+    # 부록 A — 원본 질문 + 스키마 + 명세
+    lines.append("### 부록 A — 원본 질문 및 응답 스키마")
+    lines.append("")
+    questions = spec.get("questions", "").strip()
+    lines.append("**질문 (큐레이터 입력 그대로):**")
+    lines.append("")
+    for line in questions.splitlines():
+        lines.append(line)
+    lines.append("")
+
+    schema_block = spec.get("schema_block", "").strip()
+    if schema_block:
+        lines.append("**응답 JSON 스키마:**")
+        lines.append("")
+        lines.append("```json")
+        lines.append(schema_block)
+        lines.append("```")
+        lines.append("")
+
+    lines.append("### 부록 B — 측정 명세")
+    lines.append("")
+    lines.append("| 항목 | 내용 |")
+    lines.append("|---|---|")
+    lines.append(f"| run_id | `{spec.get('run_id', '-')}` |")
+    lines.append(f"| 질문 생성 모델 | {model_label(spec.get('qgen_model', '-'))} |")
+    lines.append(f"| 보고서 생성 모델 | {model_label(spec.get('report_model', '-'))} |")
+    lines.append(f"| 시드 | {spec.get('seed', 42)} |")
+    filters = spec.get("filters", {}) or {}
+    active_filters = {k: v for k, v in filters.items() if v not in (None, "", [])}
+    if active_filters:
+        lines.append(f"| 필터 | {active_filters} |")
+    else:
+        lines.append("| 필터 | 없음 (전체 페르소나 풀) |")
+    lines.append("")
+
+    lines.append("### 부록 C — 원본 컨텍스트")
+    lines.append("")
+    lines.append("<details>")
+    lines.append("<summary>LLM에 주입한 컨텍스트 (클릭하여 펼치기)</summary>")
+    lines.append("")
+    ctx = spec.get("ctx", spec.get("context", "")).strip()
+    for line in ctx.splitlines():
+        lines.append(line)
+    lines.append("")
+    lines.append("</details>")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# v6.2 인사이트 단계 — 자동 분기 5단계 파이프라인
+#
+# 사용자 요구: "응답통계 전체가 분석 LLM에 들어가야 인사이트 도출의 의미가 있다"
+# → 발췌 없음, 전수 주입. 입력이 1M context의 50%(약 50만 토큰) 영역을
+# 초과하면 자동으로 모드 B(다회 호출 5단계)로 분기.
+#
+# 모드 A — 단일 호출  (입력 ≤ 50만 토큰)
+#   build_insight_input_single() → call_llm(INSIGHT_SINGLE_*)
+#
+# 모드 B — 5단계 파이프라인 (입력 > 50만 토큰)
+#   1. build_clusters()                            (코드 결정론, 0 호출)
+#   2. analyze_clusters_parallel()                 (cluster수 LLM 호출, 병렬)
+#   3. cross_cluster_diff()                        (1 LLM 호출)
+#   4. raw_retrieval_check()                       (옵션, default OFF)
+#   5. synthesize_insights()                       (1 LLM 호출)
+# ─────────────────────────────────────────────────────────
+
+# 한국어 1자 ≈ 1.5~2 토큰. 보수적 추산을 위해 평균 1.7 사용.
+KOREAN_CHARS_PER_TOKEN = 1.7
+
+# 자동 분기 임계값. 1M context의 50% 영역 → retrieval 감소 진입 전.
+# (1M = 1,048,576 → 50%는 약 524,288 토큰)
+TOKEN_THRESHOLD_MODE_B = 500_000
+
+# cluster당 페르소나 수 — 100명이면 응답 300건 = 약 21만자 = 32~42만 토큰
+# (모드 B 단계 2 호출 1회당 1M의 32~42% 영역, retrieval 안전권)
+PERSONAS_PER_CLUSTER = 100
+
+
+# 페르소나 narrative 11컬럼 (Nemotron 원본)
+_NARRATIVE_COLS = (
+    "persona",                      # 요약
+    "professional_persona",         # 직업적 면모
+    "family_persona",               # 가족 면모
+    "cultural_background",          # 문화적 배경
+    "arts_persona",                 # 예술 관련 면모
+    "travel_persona",               # 여행 면모
+    "culinary_persona",             # 음식 면모
+    "sports_persona",               # 스포츠
+    "hobbies_and_interests",        # 관심사
+    "skills_and_expertise",         # 숙련·전문성
+    "career_goals_and_ambitions",   # 목표·포부
+)
+
+# 페르소나 axis 속성 (응답 raw prefix · cluster axis 분포에 사용)
+_PERSONA_ATTR_COLS = (
+    "province", "age_bucket", "sex",
+    "education_level", "marital_status", "occupation",
+)
+
+
+def _ok_df(df_result: pd.DataFrame) -> pd.DataFrame:
+    if "ok" in df_result.columns:
+        return df_result[df_result["ok"] == True]  # noqa: E712
+    return df_result
+
+
+def _build_persona_attr_lookup(
+    df_personas: pd.DataFrame,
+) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    """persona_uuid → axis 속성 dict. 응답 raw prefix용."""
+    attr_cols = [
+        c for c in _PERSONA_ATTR_COLS
+        if df_personas is not None and c in df_personas.columns
+    ]
+    if (
+        df_personas is None
+        or "persona_uuid" not in df_personas.columns
+        or not attr_cols
+    ):
+        return attr_cols, {}
+    lookup = df_personas.set_index("persona_uuid")[attr_cols].to_dict(orient="index")
+    return attr_cols, lookup
+
+
+def _build_persona_narrative_block(
+    df_personas: pd.DataFrame,
+    persona_uuids: Optional[List[str]] = None,
+) -> str:
+    """페르소나 narrative 11컬럼 풀로드 → markdown 블록.
+
+    persona_uuids가 주어지면 그 페르소나만 추출, 없으면 df_personas 전체.
+    """
+    if df_personas is None or len(df_personas) == 0:
+        return "(페르소나 데이터 없음)"
+    df = df_personas
+    if persona_uuids is not None and "persona_uuid" in df.columns:
+        df = df[df["persona_uuid"].isin(persona_uuids)]
+    attr_cols = [c for c in _PERSONA_ATTR_COLS if c in df.columns]
+    narr_cols = [c for c in _NARRATIVE_COLS if c in df.columns]
+
+    blocks: List[str] = []
+    for _, row in df.iterrows():
+        attrs = ", ".join(
+            f"{c}={row[c]}" for c in attr_cols
+            if c in row and pd.notna(row[c])
+        )
+        uuid = row.get("persona_uuid", "")
+        header = f"### [{uuid}] {attrs}"
+        narr_lines = []
+        for c in narr_cols:
+            if c in row and pd.notna(row[c]) and str(row[c]).strip():
+                narr_lines.append(f"- {c}: {row[c]}")
+        blocks.append(header + "\n" + "\n".join(narr_lines))
+    return "\n\n".join(blocks)
+
+
+def _build_response_raw_block(
+    df_result: pd.DataFrame,
+    persona_attr_lookup: Dict[str, Dict[str, Any]],
+    persona_attr_cols: List[str],
+) -> str:
+    """응답 raw 전수 → '[모델, 페르소나 axis] {시나리오 응답 항목 전수 JSON}' 한 줄/행."""
+    ok = _ok_df(df_result)
+    if len(ok) == 0:
+        return "(응답 없음)"
+    resp_cols = [c for c in ok.columns if c.startswith("resp_")]
+    lines: List[str] = []
+    for _, row in ok.iterrows():
+        payload = {
+            k: row[k] for k in resp_cols
+            if k in row and pd.notna(row[k])
+        }
+        persona_attrs = persona_attr_lookup.get(row.get("persona_uuid"), {})
+        attr_pairs = [
+            f"{k}={persona_attrs[k]}"
+            for k in persona_attr_cols
+            if k in persona_attrs and pd.notna(persona_attrs[k])
+        ]
+        attr_block = ("[" + ", ".join(attr_pairs) + "] ") if attr_pairs else ""
+        lines.append(
+            f"[{model_label(row['model_id'])}] {attr_block}"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+    return "\n".join(lines)
+
+
+def _build_persona_dist_lines(df_personas: pd.DataFrame) -> str:
+    if df_personas is None or len(df_personas) == 0:
+        return "(데이터 없음)"
+    attr_specs = [
+        ("province",        "거주 지역"),
+        ("age_bucket",      "연령대"),
+        ("sex",             "성별"),
+        ("education_level", "학력"),
+        ("marital_status",  "혼인 상태"),
+        ("occupation",      "직업"),
+    ]
+    lines: List[str] = []
+    for col, label in attr_specs:
+        if col in df_personas.columns:
+            vc = df_personas[col].astype(str).value_counts().head(8)
+            items = ", ".join(f"{k} ({v})" for k, v in vc.items())
+            lines.append(f"- {label}: {items}")
+    return "\n".join(lines) if lines else "(데이터 없음)"
+
+
+def _build_stats_lines(df_result: pd.DataFrame) -> str:
+    """모델별 응답 통계 — 평균·표준편차·옵션 분포."""
+    ok = _ok_df(df_result)
+    if len(ok) == 0:
+        return "(성공 응답 없음)"
+    resp_cols = [c for c in ok.columns if c.startswith("resp_")]
+    lines: List[str] = []
+    for model in sorted(ok["model_id"].unique()):
+        sub = ok[ok["model_id"] == model]
+        lines.append(f"### {model_label(model)} (n={len(sub)})")
+        for col in resp_cols:
+            series = sub[col].dropna()
+            if len(series) == 0:
+                continue
+            if pd.api.types.is_numeric_dtype(series):
+                lines.append(
+                    f"- {col}: 평균 {series.mean():.2f}, 표준편차 {series.std():.2f}, "
+                    f"min {series.min()}, max {series.max()}"
+                )
+            else:
+                vc = series.astype(str).value_counts().head(6)
+                items = ", ".join(f"{k} ({v})" for k, v in vc.items())
+                lines.append(f"- {col}: {items}")
+    return "\n".join(lines)
+
+
+def build_report_input(
+    *,
+    topic: str,
+    context: str,
+    questions: str,
+    df_result: pd.DataFrame,
+    df_personas: pd.DataFrame,
+    spec: Optional[Dict[str, Any]] = None,
+) -> str:
+    """모드 A — 단일 호출용 user 메시지 빌더 (전수 주입, INSIGHT_SINGLE_USER_TEMPLATE 사용).
+
+    페르소나 narrative 11컬럼 + 응답 raw 시나리오별 응답 항목 전수 모두 LLM에 풀로드. 발췌 없음.
+    입력이 1M context의 50% 영역을 초과하면 main에서 모드 B로 분기되어
+    이 함수는 호출되지 않는다.
+
+    spec 인자는 axis breakdown 컴포저에 사용 가능하지만 모드 A에서는
+    persona_dist + stats만으로 충분 — 본문 axis 표가 별도 섹션에 자동
+    삽입됨.
+
+    어제 N=300 CSV는 컬럼명이 `model`이고 본 라운드 새 측정은 `model_id`인데,
+    본 함수는 `model_id` 기준으로 통계·grouping을 한다. 어제 데이터로 재검증
+    가능하도록 진입부에서 한 번 rename. 본 라운드 새 측정에는 영향 없음.
+    """
+    if "model_id" not in df_result.columns and "model" in df_result.columns:
+        df_result = df_result.rename(columns={"model": "model_id"})
+
+    persona_attr_cols, persona_lookup = _build_persona_attr_lookup(df_personas)
+    persona_dist = _build_persona_dist_lines(df_personas)
+    stats = _build_stats_lines(df_result)
+
+    persona_narratives = _build_persona_narrative_block(df_personas)
+    samples_block = _build_response_raw_block(df_result, persona_lookup, persona_attr_cols)
+
+    text = INSIGHT_SINGLE_USER_TEMPLATE.format(
+        topic=topic,
+        context=context,
+        questions=questions,
+        n_personas=df_personas.shape[0] if df_personas is not None else 0,
+        persona_dist=persona_dist,
+        persona_narratives=persona_narratives,
+        stats=stats,
+        samples_block=samples_block,
+    )
+    return text
+
+
+def estimate_input_tokens(
+    df_result: pd.DataFrame,
+    df_personas: pd.DataFrame,
+    *,
+    topic: str = "",
+    context: str = "",
+    questions: str = "",
+) -> int:
+    """모드 A 단일 호출 시 user 메시지의 한국어 토큰 추산.
+
+    실제 build_report_input을 빌드한 후 한국어 1자 ≈ 1.7 토큰으로 환산.
+    실호출 launch 전 dry-run으로 호출 → decide_mode() 입력.
+    """
+    try:
+        text = build_report_input(
+            topic=topic,
+            context=context,
+            questions=questions,
+            df_result=df_result,
+            df_personas=df_personas,
+        )
+    except Exception:
+        # 빌드 실패 시 보수적으로 큰 값 반환 → 모드 B 분기
+        return 10_000_000
+    return int(len(text) * KOREAN_CHARS_PER_TOKEN)
+
+
+def decide_mode(input_tokens: int) -> str:
+    """입력 토큰에 따라 'A' (단일 호출) or 'B' (5단계 파이프라인) 결정."""
+    return "A" if input_tokens <= TOKEN_THRESHOLD_MODE_B else "B"
+
+
+# ─────────────────────────────────────────────────────────
+# 모드 B — 5단계 파이프라인
+# ─────────────────────────────────────────────────────────
+
+def _select_cluster_axes(df_personas: pd.DataFrame) -> List[str]:
+    """cluster 분할에 사용할 axis 선택 — 분포 보존이 중요한 순서대로."""
+    candidates = ["age_bucket", "sex", "region"]
+    cols = []
+    for c in candidates:
+        if c in df_personas.columns:
+            cols.append(c)
+    # region 컬럼이 없으면 province에서 만들어 사용
+    if "region" not in cols and "province" in df_personas.columns:
+        cols.append("province")
+    return cols or [df_personas.columns[0]]
+
+
+def build_clusters(
+    df_result: pd.DataFrame,
+    df_personas: pd.DataFrame,
+    *,
+    n_clusters: Optional[int] = None,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """페르소나를 axis 분포 보존하며 stratified cluster로 분할 (코드 결정론, 0 LLM 호출).
+
+    pandas groupby().indices + np.random.RandomState 패턴 (전역 CLAUDE.md
+    검증: 메모리 압박 환경에서 boolean mask 반복 회피).
+
+    n_clusters 미지정 시 ceil(n_personas / PERSONAS_PER_CLUSTER).
+    각 cluster에 페르소나·응답을 배정해 dict 리스트로 반환.
+    """
+    import numpy as np
+
+    if df_personas is None or len(df_personas) == 0:
+        return []
+
+    n_personas = len(df_personas)
+    if n_clusters is None:
+        n_clusters = max(1, (n_personas + PERSONAS_PER_CLUSTER - 1) // PERSONAS_PER_CLUSTER)
+    n_clusters = max(1, min(n_clusters, n_personas))
+
+    if n_clusters == 1:
+        # 단일 cluster — 모드 B를 강제로 발동시킨 검증 시나리오에서 사용
+        cluster_uuids = [list(df_personas["persona_uuid"].astype(str))]
+    else:
+        # axis 분포 보존: stratification key를 만들고 그 안에서 round-robin
+        axes = _select_cluster_axes(df_personas)
+        df = df_personas.copy()
+        if "region" in axes and "region" not in df.columns and "province" in df.columns:
+            df["region"] = df["province"].apply(province_to_region)
+        strat_key = df[axes].astype(str).agg("|".join, axis=1)
+        rng = np.random.RandomState(seed)
+        cluster_assignment = np.empty(len(df), dtype=int)
+        # strat 키별 round-robin은 size=1·2 키들이 cluster 0에 쏠리므로,
+        # 각 strat 키마다 시작 offset을 무작위화해 long-run 균등 분배 확보.
+        for key, group_idx in strat_key.groupby(strat_key).indices.items():
+            shuffled = rng.permutation(group_idx)
+            offset = int(rng.randint(0, n_clusters))
+            for i, idx in enumerate(shuffled):
+                cluster_assignment[idx] = (i + offset) % n_clusters
+        cluster_uuids = []
+        for cid in range(n_clusters):
+            mask = cluster_assignment == cid
+            uuids = list(df.loc[mask, "persona_uuid"].astype(str))
+            cluster_uuids.append(uuids)
+
+    clusters: List[Dict[str, Any]] = []
+    df_result_indexed = df_result.copy()
+    df_result_indexed["persona_uuid"] = df_result_indexed["persona_uuid"].astype(str)
+
+    for cid, uuids in enumerate(cluster_uuids):
+        sub_personas = df_personas[df_personas["persona_uuid"].astype(str).isin(uuids)]
+        sub_result = df_result_indexed[df_result_indexed["persona_uuid"].isin(uuids)]
+        axis_dist_parts = []
+        for col in ("age_bucket", "sex", "education_level"):
+            if col in sub_personas.columns:
+                vc = sub_personas[col].astype(str).value_counts().head(5)
+                items = ", ".join(f"{k}({v})" for k, v in vc.items())
+                axis_dist_parts.append(f"{col}: {items}")
+        clusters.append({
+            "cluster_id": f"c{cid + 1}",
+            "df_personas": sub_personas.reset_index(drop=True),
+            "df_result": sub_result.reset_index(drop=True),
+            "n_personas": len(sub_personas),
+            "n_responses": len(sub_result),
+            "axis_dist": " | ".join(axis_dist_parts) or "(분포 없음)",
+            "share": f"{len(sub_personas) / max(1, n_personas) * 100:.1f}%",
+        })
+    return clusters
+
+
+def _call_insight_llm(
+    *,
+    model_id: str,
+    system: str,
+    user: str,
+    timeout: int = 600,
+    json_mode: bool = True,
+) -> Dict[str, Any]:
+    """인사이트 단계 LLM 호출 — JSON 응답 강건 파싱."""
+    resp = call_llm(
+        model_id, system, user,
+        json_mode=json_mode, temperature=0.5, timeout=timeout,
+    )
+    if json_mode:
+        try:
+            parsed = parse_json_response(resp.text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"인사이트 LLM JSON 파싱 실패 ({model_id}): {e}. "
+                f"응답 앞 500자: {resp.text[:500]}"
+            ) from e
+        return {"parsed": parsed, "raw_text": resp.text, "elapsed_sec": resp.elapsed_sec}
+    return {"parsed": None, "raw_text": resp.text, "elapsed_sec": resp.elapsed_sec}
+
+
+def analyze_cluster(
+    cluster: Dict[str, Any],
+    *,
+    topic: str,
+    context: str,
+    questions: str,
+    report_model: str,
+    n_clusters_total: int,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """모드 B 단계 2 — 단일 cluster 분석 LLM 호출.
+
+    cluster 내 페르소나 narrative + 응답 raw 전수 주입. 다른 cluster를
+    추측하지 않도록 prompt에 명시. 후속 cross-cluster diff에서 통합.
+    """
+    df_personas = cluster["df_personas"]
+    df_result = cluster["df_result"]
+    persona_attr_cols, persona_lookup = _build_persona_attr_lookup(df_personas)
+    persona_narratives = _build_persona_narrative_block(df_personas)
+    samples_block = _build_response_raw_block(df_result, persona_lookup, persona_attr_cols)
+    stats = _build_stats_lines(df_result)
+
+    user = CLUSTER_ANALYSIS_USER_TEMPLATE.format(
+        topic=topic,
+        context=context,
+        questions=questions,
+        cluster_id=cluster["cluster_id"],
+        n_personas=cluster["n_personas"],
+        n_responses=cluster["n_responses"],
+        axis_dist=cluster["axis_dist"],
+        cluster_share=cluster["share"],
+        persona_narratives=persona_narratives,
+        stats=stats,
+        samples_block=samples_block,
+    )
+    result = _call_insight_llm(
+        model_id=report_model,
+        system=CLUSTER_ANALYSIS_SYSTEM,
+        user=user,
+        timeout=timeout,
+    )
+    return {
+        "cluster_id": cluster["cluster_id"],
+        "n_personas": cluster["n_personas"],
+        "n_responses": cluster["n_responses"],
+        "axis_dist": cluster["axis_dist"],
+        "summary": result["parsed"],
+        "raw_text": result["raw_text"],
+        "elapsed_sec": result["elapsed_sec"],
+    }
+
+
+def analyze_clusters_parallel(
+    clusters: List[Dict[str, Any]],
+    *,
+    topic: str,
+    context: str,
+    questions: str,
+    report_model: str,
+    timeout: int = 600,
+    progress_cb=None,
+) -> List[Dict[str, Any]]:
+    """모드 B 단계 2 — cluster 분석 병렬 호출.
+
+    cluster들이 서로 독립이므로 ThreadPoolExecutor로 동시 호출.
+    wall-clock time을 cluster 수 무관 약 1~2.5분 영역으로 만드는 핵심 단계.
+
+    progress_cb(cluster_id, status, elapsed_sec) — cluster 완료마다 status.json
+    갱신용 callback (옵션).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n = len(clusters)
+    if n == 0:
+        return []
+
+    results: List[Optional[Dict[str, Any]]] = [None] * n
+    cluster_index = {c["cluster_id"]: i for i, c in enumerate(clusters)}
+
+    # max_workers는 cluster 수와 동일 — 모든 cluster 동시 호출 (LLM provider rate limit
+    # 안에서). 실측 N=10 cluster까지는 OpenRouter rate limit 한도 안.
+    max_workers = max(1, min(n, 10))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(
+                analyze_cluster,
+                c,
+                topic=topic,
+                context=context,
+                questions=questions,
+                report_model=report_model,
+                n_clusters_total=n,
+                timeout=timeout,
+            ): c["cluster_id"]
+            for c in clusters
+        }
+        for fut in as_completed(futures):
+            cid = futures[fut]
+            try:
+                res = fut.result()
+                results[cluster_index[cid]] = res
+                if progress_cb:
+                    progress_cb(cid, "ok", res.get("elapsed_sec", 0.0))
+            except Exception as e:
+                # cluster 1개 실패해도 나머지 진행 — 단계 5 합성에서 누락 처리
+                results[cluster_index[cid]] = {
+                    "cluster_id": cid,
+                    "summary": None,
+                    "error": str(e),
+                    "elapsed_sec": 0.0,
+                }
+                if progress_cb:
+                    progress_cb(cid, "fail", 0.0)
+    return [r for r in results if r is not None]
+
+
+def cross_cluster_diff(
+    cluster_results: List[Dict[str, Any]],
+    *,
+    topic: str,
+    report_model: str,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """모드 B 단계 3 — cross-cluster diff (1회 LLM 호출).
+
+    단계 2 cluster 분석 결과를 가로질러 비교 → 공통점·차이·약신호 발견.
+    단일 cluster에서는 잡히지 않는 cross-cluster 패턴을 hierarchical merging
+    방식으로 통합. 단계 4 raw retrieval 후보(suspect_cluster_ids) 지정 가능.
+    """
+    valid = [r for r in cluster_results if r.get("summary") is not None]
+    summaries_text = "\n\n---\n\n".join(
+        f"### cluster_id: {r['cluster_id']} "
+        f"(n_personas={r.get('n_personas', '?')}, n_responses={r.get('n_responses', '?')}, "
+        f"axis: {r.get('axis_dist', '-')})\n\n"
+        + json.dumps(r["summary"], ensure_ascii=False, indent=2)
+        for r in valid
+    )
+    if not summaries_text:
+        return {
+            "summary": None,
+            "error": "단계 2 cluster 분석 결과가 모두 실패했습니다",
+        }
+
+    total_personas = sum(r.get("n_personas", 0) for r in valid)
+    total_responses = sum(r.get("n_responses", 0) for r in valid)
+
+    user = CROSS_CLUSTER_DIFF_USER_TEMPLATE.format(
+        topic=topic,
+        n_clusters=len(valid),
+        total_personas=total_personas,
+        total_responses=total_responses,
+        cluster_summaries_block=summaries_text,
+    )
+    result = _call_insight_llm(
+        model_id=report_model,
+        system=CROSS_CLUSTER_DIFF_SYSTEM,
+        user=user,
+        timeout=timeout,
+    )
+    return {
+        "summary": result["parsed"],
+        "raw_text": result["raw_text"],
+        "elapsed_sec": result["elapsed_sec"],
+    }
+
+
+def raw_retrieval_check(
+    suspect_cluster_ids: List[str],
+    suspect_reason: str,
+    clusters: List[Dict[str, Any]],
+    cluster_results: List[Dict[str, Any]],
+    *,
+    report_model: str,
+    timeout: int = 600,
+) -> List[Dict[str, Any]]:
+    """모드 B 단계 4 (옵션) — 의심 cluster의 raw 자료 재주입 검증.
+
+    cross-cluster diff가 짚은 의심 cluster들의 페르소나 narrative + 응답 raw를
+    다시 LLM에 주입해 단계 2 분석을 raw에 비춰 검증·정정. default OFF.
+    """
+    if not suspect_cluster_ids:
+        return []
+    cluster_by_id = {c["cluster_id"]: c for c in clusters}
+    summary_by_id = {r["cluster_id"]: r for r in cluster_results}
+    out: List[Dict[str, Any]] = []
+    for cid in suspect_cluster_ids:
+        cluster = cluster_by_id.get(cid)
+        prev = summary_by_id.get(cid)
+        if cluster is None or prev is None or prev.get("summary") is None:
+            out.append({"cluster_id": cid, "error": "cluster 자료 누락"})
+            continue
+        df_personas = cluster["df_personas"]
+        df_result = cluster["df_result"]
+        attr_cols, lookup = _build_persona_attr_lookup(df_personas)
+        persona_narratives = _build_persona_narrative_block(df_personas)
+        samples_block = _build_response_raw_block(df_result, lookup, attr_cols)
+
+        user = RAW_RETRIEVAL_USER_TEMPLATE.format(
+            cluster_id=cid,
+            cluster_summary=json.dumps(prev["summary"], ensure_ascii=False, indent=2),
+            suspect_reason=suspect_reason,
+            persona_narratives=persona_narratives,
+            samples_block=samples_block,
+        )
+        try:
+            res = _call_insight_llm(
+                model_id=report_model,
+                system=RAW_RETRIEVAL_SYSTEM,
+                user=user,
+                timeout=timeout,
+            )
+            out.append({
+                "cluster_id": cid,
+                "verification": res["parsed"],
+                "elapsed_sec": res["elapsed_sec"],
+            })
+        except Exception as e:
+            out.append({"cluster_id": cid, "error": str(e)})
+    return out
+
+
+def synthesize_insights(
+    cluster_results: List[Dict[str, Any]],
+    diff_result: Dict[str, Any],
+    retrieval_results: List[Dict[str, Any]],
+    *,
+    topic: str,
+    context: str,
+    n_clusters: int,
+    total_personas: int,
+    total_responses: int,
+    report_model: str,
+    timeout: int = 600,
+) -> Dict[str, Any]:
+    """모드 B 단계 5 — 최종 인사이트 합성 (1회 LLM 호출).
+
+    모든 단계(2~4) 결과를 통합해 4섹션 JSON 출력. 단일 호출 모드 A와 동일한 schema.
+    """
+    valid_clusters = [r for r in cluster_results if r.get("summary") is not None]
+    cluster_summaries_block = "\n\n---\n\n".join(
+        f"### cluster_id: {r['cluster_id']}\n"
+        + json.dumps(r["summary"], ensure_ascii=False, indent=2)
+        for r in valid_clusters
+    )
+    diff_block = (
+        json.dumps(diff_result.get("summary"), ensure_ascii=False, indent=2)
+        if diff_result.get("summary")
+        else f"(단계 3 실패: {diff_result.get('error', '알 수 없음')})"
+    )
+    retrieval_used = "예" if retrieval_results else "아니오 (default OFF)"
+    if retrieval_results:
+        retrieval_block = "\n\n".join(
+            f"### cluster_id: {r['cluster_id']}\n"
+            + (
+                json.dumps(r.get("verification"), ensure_ascii=False, indent=2)
+                if r.get("verification")
+                else f"(검증 실패: {r.get('error', '알 수 없음')})"
+            )
+            for r in retrieval_results
+        )
+    else:
+        retrieval_block = "(단계 4 미실행)"
+
+    # 컨텍스트가 길면 절반으로 자름 — 합성 단계는 클러스터 결과 통합이 핵심,
+    # 원본 컨텍스트는 단계 2에서 이미 cluster별로 봤음.
+    context_short = context[:5000] + (" …(이하 생략)" if len(context) > 5000 else "")
+
+    user = SYNTHESIS_USER_TEMPLATE.format(
+        topic=topic,
+        context_short=context_short,
+        total_personas=total_personas,
+        total_responses=total_responses,
+        n_clusters=n_clusters,
+        retrieval_used=retrieval_used,
+        cluster_summaries_block=cluster_summaries_block,
+        diff_block=diff_block,
+        retrieval_block=retrieval_block,
+    )
+    result = _call_insight_llm(
+        model_id=report_model,
+        system=SYNTHESIS_SYSTEM,
+        user=user,
+        timeout=timeout,
+    )
+    return {
+        "summary": result["parsed"],
+        "raw_text": result["raw_text"],
+        "elapsed_sec": result["elapsed_sec"],
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# 4섹션 JSON → markdown 변환 (모드 A·B 공통)
+# ─────────────────────────────────────────────────────────
+
+def _md_escape_pipe(s: Any) -> str:
+    """markdown 표 셀 안에서 파이프 문자가 컬럼 구분자로 오해되지 않게 escape."""
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+def insight_json_to_markdown(insight: Optional[Dict[str, Any]]) -> str:
+    """모드 A·B 출력(4섹션 JSON)을 보고서 본문 markdown 4섹션으로 변환.
+
+    INSIGHT_SINGLE_USER_TEMPLATE / SYNTHESIS_USER_TEMPLATE의 출력 schema와
+    1:1 매칭. drift 시 누락 섹션은 빈 메시지로 graceful degrade.
+    """
+    if not isinstance(insight, dict):
+        return (
+            "## 핵심 발견\n\n인사이트 생성에 실패했습니다 (응답 형식 불일치).\n\n"
+            "원천 응답은 result.csv에 그대로 남아 있습니다.\n"
+        )
+    out: List[str] = []
+
+    # 핵심 발견
+    out.append("## 핵심 발견")
+    out.append("")
+    findings = insight.get("key_findings") or []
+    if findings:
+        out.append("| 발견 | 내용 |")
+        out.append("|---|---|")
+        for f in findings:
+            label = _md_escape_pipe(f.get("label", "")) if isinstance(f, dict) else _md_escape_pipe(f)
+            content = _md_escape_pipe(f.get("content", "")) if isinstance(f, dict) else ""
+            out.append(f"| {label} | {content} |")
+    else:
+        out.append("(핵심 발견 없음)")
+    out.append("")
+
+    # 큐레이터 관점·가설
+    out.append("## 큐레이터 관점·가설")
+    out.append("")
+    hypotheses = insight.get("curator_hypotheses") or []
+    if hypotheses:
+        for i, h in enumerate(hypotheses, 1):
+            if isinstance(h, dict):
+                target = h.get("target_group", "")
+                form = h.get("form", "")
+                content = h.get("content", "")
+                head = f"**{i}. {form}** — 대상: {target}" if form or target else f"**{i}.**"
+                out.append(head)
+                if content:
+                    out.append("")
+                    out.append(content)
+            else:
+                out.append(f"**{i}.** {h}")
+            out.append("")
+    else:
+        out.append("(가설 없음)")
+        out.append("")
+
+    # 곱씹을 만한 응답
+    out.append("## 곱씹을 만한 응답")
+    out.append("")
+    quotes = insight.get("responses_to_chew_on") or []
+    if quotes:
+        for q in quotes:
+            if isinstance(q, dict):
+                attrs = q.get("persona_attrs", "")
+                model = q.get("model", "")
+                quote = q.get("quote", "")
+                note = q.get("curator_note", "")
+                head = f"**({model} · {attrs})**" if model or attrs else ""
+                if head:
+                    out.append(head)
+                if quote:
+                    out.append("")
+                    out.append(f"> {quote}")
+                if note:
+                    out.append("")
+                    out.append(f"_{note}_")
+                out.append("")
+            else:
+                out.append(f"- {q}")
+                out.append("")
+    else:
+        out.append("(인용 없음)")
+        out.append("")
+
+    # 다음에 던져볼 질문·가설
+    out.append("## 다음에 던져볼 질문·가설")
+    out.append("")
+    questions = insight.get("next_questions") or []
+    if questions:
+        for q in questions:
+            out.append(f"- {q}")
+    else:
+        out.append("(후속 질문 없음)")
+    out.append("")
+
+    return "\n".join(out)
+
+
+# ─────────────────────────────────────────────────────────
+# PDF + PNG 렌더 (weasyprint, pypdfium2)
+# ─────────────────────────────────────────────────────────
+
+REPORT_HTML_CSS = """
+@page { size: A4; margin: 18mm 16mm; }
+body { font-family: 'Noto Sans CJK KR', 'Noto Sans KR', sans-serif;
+       font-size: 10.5pt; line-height: 1.55; color: #222; }
+h1 { font-size: 18pt; margin: 0 0 8pt 0; }
+h2 { font-size: 13pt; margin: 14pt 0 4pt 0; border-bottom: 0.5pt solid #888; padding-bottom: 2pt; }
+h3 { font-size: 11pt; margin: 8pt 0 2pt 0; }
+p, li { margin: 2pt 0; }
+ul, ol { margin: 2pt 0 4pt 18pt; padding: 0; }
+code { background: #f0f0f0; padding: 0 2pt; border-radius: 2pt; }
+pre { background: #f7f7f7; padding: 6pt; border-radius: 3pt;
+      white-space: pre-wrap; word-break: break-word; font-size: 9pt; }
+blockquote { border-left: 2pt solid #aaa; margin: 4pt 0 4pt 4pt;
+             padding: 2pt 8pt; color: #555; }
+table { border-collapse: collapse; width: 100%; margin: 6pt 0; font-size: 9.5pt; }
+th { background: #e8e8e8; text-align: left; padding: 4pt 6pt;
+     border: 0.4pt solid #aaa; font-weight: bold; }
+td { padding: 3pt 6pt; border: 0.4pt solid #ccc; vertical-align: top; }
+tr:nth-child(even) td { background: #f9f9f9; }
+details summary { cursor: pointer; color: #444; font-style: italic; }
+img { max-width: 100%; height: auto; display: block; margin: 6pt auto; }
+"""
+
+
+def render_report_files(run_dir: Path, report_md: str, topic: str) -> None:
+    """report.md → report.pdf → report.png. 시스템 폰트 fallback 사용.
+
+    report.md 자체가 ``# knowing-koreans · …`` 헤더를 포함하므로 별도의
+    HTML <h1> wrapper는 두지 않는다. <title>만 PDF 메타로 사용.
+    """
+    import markdown as md_lib  # type: ignore
+    from weasyprint import CSS, HTML  # type: ignore
+    import pypdfium2 as pdfium  # type: ignore
+
+    body_html = md_lib.markdown(report_md, extensions=["fenced_code", "tables"])
+    title_for_pdf = (_topic_short(topic, limit=60) or "knowing-koreans 보고서")
+    full_html = (
+        f"<html><head><meta charset='utf-8'><title>{title_for_pdf}</title></head>"
+        f"<body>{body_html}</body></html>"
+    )
+    pdf_path = run_dir / "report.pdf"
+    # base_url=run_dir — markdown ![](chart_appeal.png) 같은 상대경로를
+    # run_dir/chart_appeal.png로 해석하기 위한 weasyprint 설정.
+    HTML(string=full_html, base_url=str(run_dir)).write_pdf(
+        target=str(pdf_path),
+        stylesheets=[CSS(string=REPORT_HTML_CSS)],
+    )
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    if len(pdf) == 0:
+        raise RuntimeError("렌더된 PDF에 페이지가 없음")
+    page = pdf[0]
+    pil_image = page.render(scale=2.0).to_pil()  # DPI ≈ 144
+    pil_image.save(run_dir / "report.png", format="PNG", optimize=True)
+    pdf.close()
+
+
+def build_sources_zip(run_dir: Path) -> None:
+    """spec.json + personas.csv + result.csv + report.md → sources.zip."""
+    zip_path = run_dir / "sources.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in ("spec.json", "personas.csv", "result.csv", "report.md"):
+            p = run_dir / name
+            if p.exists():
+                zf.write(p, arcname=name)
+
+
+# ─────────────────────────────────────────────────────────
+# 메인 흐름
+# ─────────────────────────────────────────────────────────
+
+def _append_result_row(result_path: Path, row: Dict[str, Any], header_written: bool) -> bool:
+    """단일 row를 result.csv에 append. 첫 호출은 header 포함."""
+    df = pd.DataFrame([row])
+    if not header_written:
+        df.to_csv(result_path, index=False, encoding="utf-8")
+        return True
+    df.to_csv(result_path, index=False, header=False, mode="a", encoding="utf-8")
+    return True
+
+
+def main(run_dir: Path) -> int:
+    run_dir = Path(run_dir)
+    spec_path = run_dir / "spec.json"
+    if not spec_path.exists():
+        print(f"[fatal] spec.json 없음: {spec_path}", file=sys.stderr)
+        return 2
+
+    spec: Dict[str, Any] = json.loads(spec_path.read_text(encoding="utf-8"))
+
+    n_total = int(spec["n"]) * len(spec["models"])
+    status: Dict[str, Any] = {
+        "run_id": spec["run_id"],
+        "owner": spec.get("owner", ""),
+        "topic_short": (spec.get("topic", "") or "")[:30],
+        "phase": "starting",
+        "started_at": _now_iso(),
+        "updated_at": None,
+        "n_total": n_total,
+        "n_done": 0,
+        "n_ok": 0,
+        "n_fail": 0,
+        "avg_sec_per_call": 0.0,
+        "eta_sec": None,
+        "report_ready": False,
+        "finished_at": None,
+        "error": None,
+    }
+    write_status(run_dir, status)
+
+    try:
+        # ── 사전 검증 (schema/engine drift) ─────────────
+        errors = validate_spec(spec)
+        if errors:
+            status["phase"] = "error"
+            status["error"] = "사전 검증 실패: " + " / ".join(errors)
+            status["finished_at"] = _now_iso()
+            write_status(run_dir, status)
+            print(f"[abort] 사전 검증 실패: {errors}", file=sys.stderr)
+            return 3
+
+        # ── 페르소나 풀 로드 ───────────────────────────
+        status["phase"] = "loading_pool"
+        write_status(run_dir, status)
+        if CANCEL:
+            return _finalize_cancelled(run_dir, status)
+        print(f"[1/4] 페르소나 풀 로드 중 (PERSONA_DIR={PERSONA_DIR})", flush=True)
+        df_pool = load_all_personas(PERSONA_DIR)
+        print(f"      {len(df_pool):,}건 로드", flush=True)
+
+        # ── 샘플링 ────────────────────────────────────
+        if CANCEL:
+            return _finalize_cancelled(run_dir, status)
+        status["phase"] = "sampling"
+        write_status(run_dir, status)
+        filters = spec.get("filters", {}) or {}
+        sample_kwargs = {k: v for k, v in filters.items() if v not in (None, "", [])}
+        df_personas = sample_personas(
+            n=int(spec["n"]),
+            seed=int(spec.get("seed", 42)),
+            df=df_pool,
+            **sample_kwargs,
+        )
+        df_personas.to_csv(run_dir / "personas.csv", index=False, encoding="utf-8")
+        print(f"[2/4] 표본 {len(df_personas)}명 추출", flush=True)
+        del df_pool  # 1M행 풀은 즉시 해제
+
+        # ── LLM 호출 루프 ─────────────────────────────
+        status["phase"] = "calling_llm"
+        write_status(run_dir, status)
+
+        ctx = spec.get("ctx", "") or ""
+        questions = spec.get("questions", "") or ""
+        schema_block = spec.get("schema_block", "") or ""
+        example_block = build_response_example(schema_block)
+        result_path = run_dir / "result.csv"
+        header_written = False
+        elapsed_total = 0.0
+        n_done = 0
+        n_ok = 0
+        n_fail = 0
+        rows_buffer: List[Dict[str, Any]] = []  # 보고서 빌드용 메모리 버퍼
+
+        print(f"[3/4] 응답 수집 시작 — 총 {n_total}회", flush=True)
+
+        for _, persona_row in df_personas.iterrows():
+            persona_dict = persona_row.to_dict()
+            system = render_template(SYSTEM_TEMPLATE, persona_dict)
+            user_msg = DYNAMIC_USER_TEMPLATE.format(
+                context=ctx, questions=questions,
+                schema=schema_block, example=example_block,
+            )
+            persona_uuid = persona_dict.get("persona_uuid", "")
+            for model_id in spec["models"]:
+                if CANCEL:
+                    return _finalize_cancelled(run_dir, status)
+                row: Dict[str, Any] = {
+                    "persona_uuid": persona_uuid,
+                    "model_id": model_id,
+                    "ok": False,
+                }
+                t0 = time.monotonic()
+                try:
+                    resp = call_llm(
+                        model_id, system, user_msg,
+                        json_mode=True, temperature=0.7, timeout=180,
+                    )
+                    row["elapsed_sec"] = round(resp.elapsed_sec, 2)
+                    row["raw_json"] = resp.text
+                    try:
+                        parsed = json.loads(resp.text)
+                        if isinstance(parsed, dict):
+                            for k, v in parsed.items():
+                                row[f"resp_{k}"] = v
+                            row["ok"] = True
+                        else:
+                            row["error"] = f"JSON이 dict가 아님: {type(parsed).__name__}"
+                    except json.JSONDecodeError as e:
+                        row["error"] = f"JSON 파싱 실패: {e}"
+                except Exception as e:
+                    row["error"] = str(e)
+                t1 = time.monotonic()
+                elapsed_total += (t1 - t0)
+                header_written = _append_result_row(result_path, row, header_written)
+                rows_buffer.append(row)
+                n_done += 1
+                if row.get("ok"):
+                    n_ok += 1
+                else:
+                    n_fail += 1
+                avg = elapsed_total / n_done
+                eta = int(max(0.0, (n_total - n_done) * avg))
+                status["n_done"] = n_done
+                status["n_ok"] = n_ok
+                status["n_fail"] = n_fail
+                status["avg_sec_per_call"] = round(avg, 2)
+                status["eta_sec"] = eta
+
+                # 매 5건 또는 마지막에 status.json 갱신 (IO 부담 감축)
+                if n_done % 5 == 0 or n_done == n_total:
+                    write_status(run_dir, status)
+                    print(
+                        f"  [{n_done}/{n_total}] ok={n_ok} fail={n_fail} "
+                        f"avg={avg:.2f}s eta={eta}s",
+                        flush=True,
+                    )
+
+        # 루프 끝에 status.json 한 번 더 보장
+        write_status(run_dir, status)
+
+        # ── 유효 응답 0건이면 보고서 생성 자체를 건너뛴다 ───────────────
+        # Opus 4.7이 빈 표본으로 "있어 보이는 가짜 분석"을 만들어내는 사고
+        # (예: 50건 모두 rate-limit 실패인데 페르소나 분포만 보고 가설을
+        #  찍어내는 케이스)을 차단합니다. 진단은 result.csv의 error 컬럼.
+        if not CANCEL and n_ok == 0:
+            status["phase"] = "error"
+            status["error"] = (
+                f"유효 응답 0건 — {n_total}건 모두 실패했습니다. "
+                f"result.csv의 error 컬럼에서 원인을 확인하실 수 있습니다. "
+                f"(흔한 원인: 모델 rate-limit·:free 한도 초과·토큰 한도·JSON 파싱 실패)"
+            )
+            status["report_ready"] = False
+            status["finished_at"] = _now_iso()
+            write_status(run_dir, status)
+            print(
+                f"[abort] n_ok=0 / n_fail={n_fail} — 보고서 생성을 건너뜁니다",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
+        # ── 보고서 컴파일 ─────────────────────────────
+        if CANCEL:
+            return _finalize_cancelled(run_dir, status)
+        status["phase"] = "writing_report"
+        write_status(run_dir, status)
+        print("[4/4] 보고서 컴파일", flush=True)
+
+        df_result = pd.DataFrame(rows_buffer)
+
+        # (a) 헤더 — 코드 생성
+        header_md = compose_header(
+            spec,
+            n_personas=len(df_personas),
+            n_models=len(spec.get("models", [])),
+            n_responses=len(df_result),
+        )
+
+        # (b) 측정 개요 — 코드 생성 (인포그래픽 PNG 3종도 run_dir에 저장)
+        overview_md = compose_overview(spec, df_personas, df_result, run_dir=run_dir)
+
+        # (c) 인사이트 — v6.2 자동 분기 파이프라인 (모드 A 단일 호출 / 모드 B 5단계)
+        report_model = spec.get("report_model") or "openrouter/anthropic/claude-opus-4.7"
+        topic_str = spec.get("topic", "") or "(주제 없음)"
+
+        # 인사이트 prompt schema 사전 검증 — drift 즉시 차단 (zero cost)
+        try:
+            validate_insight_prompt_schema()
+        except Exception as e:
+            print(f"[abort] 인사이트 prompt schema 검증 실패: {e}", file=sys.stderr, flush=True)
+            status["phase"] = "error"
+            status["error"] = f"인사이트 prompt schema 검증 실패: {e}"
+            status["finished_at"] = _now_iso()
+            write_status(run_dir, status)
+            return 4
+
+        # 토큰 추산 → 모드 결정
+        status["phase"] = "estimating_tokens"
+        write_status(run_dir, status)
+        input_tokens = estimate_input_tokens(
+            df_result, df_personas,
+            topic=topic_str, context=ctx, questions=questions,
+        )
+        mode = decide_mode(input_tokens)
+        status["insight_mode"] = mode
+        status["insight_input_tokens"] = input_tokens
+        print(
+            f"      인사이트 입력 추산: {input_tokens:,} 토큰 → 모드 {mode}",
+            flush=True,
+        )
+
+        insight_json: Optional[Dict[str, Any]] = None
+        insight_error: Optional[str] = None
+
+        if mode == "A":
+            # 모드 A — 단일 호출 (입력 ≤ 50만 토큰)
+            status["phase"] = "calling_insight_llm"
+            write_status(run_dir, status)
+            try:
+                report_user = build_report_input(
+                    topic=topic_str,
+                    context=ctx,
+                    questions=questions,
+                    df_result=df_result,
+                    df_personas=df_personas,
+                    spec=spec,
+                )
+                res = _call_insight_llm(
+                    model_id=report_model,
+                    system=INSIGHT_SINGLE_SYSTEM,
+                    user=report_user,
+                    timeout=600,
+                )
+                insight_json = res["parsed"]
+            except Exception as e:
+                insight_error = f"모드 A LLM 호출 실패: {e}"
+                print(f"[warn] {insight_error}", file=sys.stderr, flush=True)
+                status["error"] = (status.get("error") or "") + f" / insight_failed: {e}"
+        else:
+            # 모드 B — 5단계 파이프라인 (입력 > 50만 토큰)
+            status["phase"] = "analyzing_clusters"
+            write_status(run_dir, status)
+            try:
+                clusters = build_clusters(
+                    df_result, df_personas,
+                    seed=int(spec.get("seed", 42)),
+                )
+                n_clusters = len(clusters)
+                status["insight_n_clusters"] = n_clusters
+                status["insight_clusters_done"] = 0
+                status["insight_clusters_failed"] = 0
+                write_status(run_dir, status)
+                print(
+                    f"      모드 B — cluster {n_clusters}개로 분할, 병렬 분석 시작",
+                    flush=True,
+                )
+
+                # 단계 2 — cluster 병렬 분석
+                done_count = {"ok": 0, "fail": 0}
+
+                def _cluster_progress(cid: str, st: str, elapsed: float) -> None:
+                    if st == "ok":
+                        done_count["ok"] += 1
+                    else:
+                        done_count["fail"] += 1
+                    status["insight_clusters_done"] = done_count["ok"]
+                    status["insight_clusters_failed"] = done_count["fail"]
+                    write_status(run_dir, status)
+                    print(
+                        f"      [cluster {cid}] {st} ({elapsed:.1f}s) "
+                        f"진행 {done_count['ok']}/{n_clusters}",
+                        flush=True,
+                    )
+
+                cluster_results = analyze_clusters_parallel(
+                    clusters,
+                    topic=topic_str,
+                    context=ctx,
+                    questions=questions,
+                    report_model=report_model,
+                    timeout=600,
+                    progress_cb=_cluster_progress,
+                )
+
+                # 단계 3 — cross-cluster diff
+                status["phase"] = "cross_cluster_diff"
+                write_status(run_dir, status)
+                diff_result = cross_cluster_diff(
+                    cluster_results,
+                    topic=topic_str,
+                    report_model=report_model,
+                    timeout=600,
+                )
+
+                # 단계 4 — raw retrieval (default OFF)
+                retrieval_results: List[Dict[str, Any]] = []
+                if spec.get("insight_raw_retrieval"):
+                    diff_summary = diff_result.get("summary") or {}
+                    suspect_ids = diff_summary.get("suspect_cluster_ids") or []
+                    suspect_reason = diff_summary.get("suspect_reason") or ""
+                    if suspect_ids:
+                        status["phase"] = "raw_retrieval"
+                        write_status(run_dir, status)
+                        retrieval_results = raw_retrieval_check(
+                            suspect_ids, suspect_reason, clusters, cluster_results,
+                            report_model=report_model, timeout=600,
+                        )
+
+                # 단계 5 — 합성
+                status["phase"] = "synthesizing"
+                write_status(run_dir, status)
+                total_personas = sum(c["n_personas"] for c in clusters)
+                total_responses = sum(c["n_responses"] for c in clusters)
+                synth = synthesize_insights(
+                    cluster_results, diff_result, retrieval_results,
+                    topic=topic_str, context=ctx,
+                    n_clusters=n_clusters,
+                    total_personas=total_personas,
+                    total_responses=total_responses,
+                    report_model=report_model,
+                    timeout=600,
+                )
+                insight_json = synth.get("summary")
+
+                # 모드 B 부산물을 run_dir에 보존 — 디버깅·재현용
+                try:
+                    (run_dir / "insight_b_clusters.json").write_text(
+                        json.dumps(
+                            [
+                                {
+                                    "cluster_id": r.get("cluster_id"),
+                                    "n_personas": r.get("n_personas"),
+                                    "n_responses": r.get("n_responses"),
+                                    "axis_dist": r.get("axis_dist"),
+                                    "summary": r.get("summary"),
+                                    "error": r.get("error"),
+                                }
+                                for r in cluster_results
+                            ],
+                            ensure_ascii=False, indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    (run_dir / "insight_b_diff.json").write_text(
+                        json.dumps(diff_result.get("summary"), ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    if retrieval_results:
+                        (run_dir / "insight_b_retrieval.json").write_text(
+                            json.dumps(retrieval_results, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                except Exception as e:
+                    print(f"[warn] 모드 B 부산물 저장 실패: {e}", file=sys.stderr, flush=True)
+            except Exception as e:
+                insight_error = f"모드 B 파이프라인 실패: {e}"
+                print(f"[warn] {insight_error}", file=sys.stderr, flush=True)
+                status["error"] = (status.get("error") or "") + f" / insight_failed: {e}"
+
+        status["phase"] = "writing_report"
+        write_status(run_dir, status)
+
+        if insight_json is None:
+            insights_md = (
+                "## 핵심 발견\n\n인사이트 생성에 실패했습니다.\n\n"
+                f"오류: `{insight_error or 'JSON 파싱 실패'}`\n\n"
+                "원천 응답은 result.csv에 그대로 남아 있습니다.\n"
+            )
+        else:
+            try:
+                (run_dir / "insight.json").write_text(
+                    json.dumps(insight_json, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"[warn] insight.json 저장 실패: {e}", file=sys.stderr, flush=True)
+            insights_md = insight_json_to_markdown(insight_json)
+
+        # (d) 인사이트를 둘로 분리 — 핵심발견·가설 / 곱씹을응답·다음질문
+        top_insights, bottom_insights = split_insights(insights_md)
+
+        # (e) 응답자 속성 축별 분포 — 코드 생성
+        axis_md = compose_axis_breakdown(spec, df_personas, df_result)
+
+        # (f) 부록 — 코드 생성 (원본 질문/스키마/명세 포함)
+        appendix_md = compose_appendix(spec, df_personas, df_result)
+
+        # (g) 합치기: 헤더 + 주의문 + 측정개요 + 핵심발견·가설 + 축별분포 + 곱씹을응답·다음질문 + 부록
+        disclaimer = (
+            "> ⚠️ **해석 주의**: 본 보고서는 합성 페르소나·LLM 시뮬레이션 결과입니다. "
+            "실제 여론이 아니며, \"이 모델·이 표본에서는 ~한 신호가 보인다\" 정도로만 "
+            "읽어 주세요.\n"
+        )
+        sections = [
+            header_md,
+            disclaimer,
+            overview_md,
+            top_insights,
+            axis_md,
+            bottom_insights,
+            appendix_md,
+        ]
+        report_md = "\n".join(s for s in sections if s and s.strip())
+
+        (run_dir / "report.md").write_text(report_md, encoding="utf-8")
+
+        # PDF + PNG + sources.zip
+        try:
+            render_report_files(run_dir, report_md, spec.get("topic", "") or "보고서")
+        except Exception as e:
+            # PDF/PNG 실패해도 report.md는 남기고 보고서 미완성 표기
+            print(f"[warn] PDF/PNG 렌더 실패: {e}", file=sys.stderr, flush=True)
+            status["error"] = (status.get("error") or "") + f" / pdf_render_failed: {e}"
+
+        try:
+            build_sources_zip(run_dir)
+        except Exception as e:
+            print(f"[warn] sources.zip 생성 실패: {e}", file=sys.stderr, flush=True)
+            status["error"] = (status.get("error") or "") + f" / zip_failed: {e}"
+
+        status["report_ready"] = True
+        status["phase"] = "done"
+        status["finished_at"] = _now_iso()
+        write_status(run_dir, status)
+        print("[done]", flush=True)
+        return 0
+
+    except Exception as e:
+        status["phase"] = "error"
+        status["error"] = repr(e)
+        status["finished_at"] = _now_iso()
+        write_status(run_dir, status)
+        print(f"[fatal] {e!r}", file=sys.stderr, flush=True)
+        raise
+
+
+def _finalize_cancelled(run_dir: Path, status: Dict[str, Any]) -> int:
+    status["phase"] = "cancelled"
+    status["finished_at"] = _now_iso()
+    write_status(run_dir, status)
+    print("[cancelled]", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("사용법: python -m backend.run_worker <run_dir>", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(main(Path(sys.argv[1])))

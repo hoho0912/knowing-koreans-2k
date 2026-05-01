@@ -1,15 +1,16 @@
 # knowing-koreans backend 의존성
 # Python 3.9+
 
-# 페르소나 데이터셋 로드
+# 페르소나 데이터셋 로드 (NVIDIA Nemotron-Personas-Korea, CC BY 4.0)
 huggingface_hub>=0.25.0
 pyarrow>=15.0.0
 pandas>=2.0.0
+numpy>=1.24.0
 
 # LLM 호출 (OpenAI 직접 + OpenRouter는 OpenAI SDK + base_url 변경)
 openai>=1.40.0
 
-# Ollama 로컬 호출 (선택, requests로도 가능)
+# Ollama 로컬 호출 (선택 — requests 로 직접 호출하므로 별도 패키지 불필요)
 # ollama>=0.3.0
 
 # 환경변수 로드
@@ -17,3 +18,14 @@ python-dotenv>=1.0.0
 
 # HTTP
 requests>=2.32.0
+httpx>=0.25.0
+
+# 보고서 렌더링 (markdown → HTML → PDF/PNG)
+markdown>=3.5.0
+matplotlib>=3.7.0
+weasyprint>=60.0
+pypdfium2>=4.20.0
+Pillow>=10.0.0
+
+# (선택) Streamlit 게이트웨이 — gateway.py 실행 시에만 필요
+streamlit>=1.30.0

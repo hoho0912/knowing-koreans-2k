@@ -11,11 +11,14 @@ venv/
 .env
 .env.local
 .env.*.local
+.creds-kk.json
 
-# 데이터 (큰 파일은 깃허브 안 올림)
+# 데이터 (큰 파일은 깃허브 안 올림 — 심링크도 함께 차단)
 backend/nvidia-personas/
+backend/nvidia-personas
 backend/data/
 backend/response/
+backend/response
 backend/logs/
 
 # 핸드오프 작업본 (전역 CLAUDE.md 백업 등 sensitive)
@@ -23,6 +26,21 @@ _handoff_to_winpc/
 
 # 결과 — backend/results는 백업용으로 로컬에만, frontend/data로 복사된 것만 깃허브
 backend/results/
+
+# 작업 일지 — 내부용 (KVM 호스트명 등 인프라 정보 포함)
+작업일지.md
+
+# B2 회수·KVM 동기화 작업본 (내부용)
+_b2_recovered/
+_b2_sync/
+
+# 측정·검증 ad-hoc 스크립트 + e2e 산출물 (메인 파이프라인은 run_*.py)
+backend/_e2e_grok_insight.py
+backend/_e2e_runs/
+backend/_recover_b2_resp.py
+backend/_reinject_insight_b2.py
+backend/_verify_pdf_integration.py
+backend/_verify_v6_2.py
 
 # OS
 .DS_Store
@@ -33,6 +51,7 @@ Thumbs.db
 # 사용자별 IDE/Agent 설정 + 서버 PAT/접속 일지 (sensitive)
 .claude/
 .server-logs/
+CLAUDE.md
 
 # IDE
 .vscode/
