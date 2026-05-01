@@ -56,7 +56,7 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 | ② N=100 본 측정 A+B | 4-28 밤 | 페르소나 100명 × 모델 4종 = 응답 397건 | 비율 **1.88배**. 모델별 std 격차 극단: claude-haiku-4.5 std 0.75(no 67%) ↔ gpt-4o-mini std 0.17(yes 97%) ↔ gemini-2.5-flash std 0.43(yes 0%·maybe 82%) ↔ qwen-2.5-72b std 0.25 |
 | ③ 3차 모델 후보 smoke | 4-29 오전 | 페르소나 5명 × 모델 7종 = 응답 35건 | qwen3-max·hermes-4-405b 공동 1위 (std 0.89, claude-haiku-4.5 baseline 초과). deepseek-v3.2 std 0.00 — mode collapse |
 | ④ 본 측정 7항목 | 4-29 저녁 | 페르소나 100명 × 모델 3종 = 응답 300건 | qwen3-max(std 0.89) / hermes-4-70b(std 0.69) / claude-haiku-4.5(mean 2.58) — 7항목 구조화 응답으로 ambivalence 가시화 |
-| ⑤ 본 라운드 N=1,000 | 5-01 새벽 | 페르소나 1,000명 × hermes-4-405b 단일 = 응답 1,000건 | **박물관 관람료 무료화 시나리오**. 5질문(Likert 3 + 카테고리 1 + 자유서술 1)을 단일 모델로 던져 페르소나 변동 폭을 본다 |
+| ⑤ 본 라운드 N=1,000 | 5-01 새벽 | 페르소나 1,000명 × hermes-4-405b 단일 = 응답 1,000건 | **박물관 관람료 유료화 도입 논쟁 시나리오**. 5질문(Likert 3 + 카테고리 1 + 자유서술 1)을 단일 모델로 던져 페르소나 변동 폭을 본다 |
 
 사전 측정 없이 모델 1~2개로 곧바로 본 측정에 들어가면 모델 편향이 결과를 지배해 페르소나 시뮬 의미가 사라진다. 본 저장소는 이 절차를 공개해 후속 연구·도메인 응용이 같은 함정에 빠지지 않게 한다.
 
@@ -64,7 +64,7 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 
 본 저장소는 한국의 박물관·문화 분야에서 합성 페르소나 시뮬을 적용한 첫 공개 시도다. NVIDIA Nemotron-Personas-Korea의 한국 인구통계 분포(약 700만 페르소나 × 7개 narrative 컬럼)를 기반으로 박물관·전시·문화재 시나리오에 대한 응답을 큐레이터의 가설 발생 도구로 변환한다.
 
-**본 저장소가 외부 공개로 진행한 첫 사례는 박물관 관람료 무료화다** — 박물관·미술관 관람료를 무료화했을 때 한국 인구통계 분포의 시민이 "실제 가서 볼 의향"·"가장 끌리는 요소"·"가장 걱정되는 점"을 어떻게 자유서술하는지를 ⑤단계 N=1,000 측정으로 본다.
+**본 저장소가 외부 공개로 진행한 첫 사례는 박물관 관람료 유료화 도입 논쟁이다** — 국립중앙박물관 관람료를 유료화하자는 논쟁이 격렬한 상황에서 한국 인구통계 분포의 시민이 찬반 입장·지불 의향·취약계층 면제 조건·자유서술을 어떻게 응답하는지를 ⑤단계 N=1,000 측정으로 본다.
 
 후속 시나리오 후보:
 
@@ -78,7 +78,7 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 
 → https://hoho0912.github.io/knowing-koreans-2k/
 
-페이지는 stlite + Pyodide 기반으로 브라우저에서 직접 Python을 돌려 시뮬 결과 CSV를 차트로 띄운다. 두 단면을 함께 노출한다 — **① prototype 단면**(페르소나 25건, 전시 콘셉트 호감도 시나리오)으로 도구 동작을 보여주고, **② 본 라운드 N=1,000 단면**(박물관 관람료 무료화 시나리오, 응답 성공 998건)에서 다음 4섹션 보고서를 함께 노출한다.
+페이지는 stlite + Pyodide 기반으로 브라우저에서 직접 Python을 돌려 시뮬 결과를 차트로 띄운다. 현재 페이지에서는 **본 라운드 N=1,000 단면**(박물관 관람료 유료화 도입 논쟁 시나리오, 응답 성공 998건) 한 건만 공개하며, 12섹션 보고서 본문(측정 개요·한눈에 보기 차트·핵심 발견·큐레이터 관점·축별 분포·곱씹을 만한 응답·다음 질문·부록)을 그대로 노출한다. 1차 prototype 25건(전시 콘셉트 호감도 시나리오)은 도구 동작 확인용 사전 측정으로 본 저장소의 측정 라운드 표(아래)에 이력만 남겨 두며, 결과 소개 페이지에는 노출하지 않는다.
 
 | 영역 | 내용 |
 |---|---|
@@ -144,9 +144,20 @@ python -m backend.run_scenario \
 
 ## 시나리오 만들기
 
-본 저장소가 핵심으로 권하는 사용 방식입니다. 본인 분야의 시나리오를 추가해 LLM 페르소나 시뮬을 굴려 보세요.
+본 저장소는 두 가지 시나리오 운영 방식을 제공합니다. 도메인을 새로 만들 때는 둘 중 어느 path로 갈지 먼저 결정하세요.
 
-### 디렉토리 구조
+| Path | 진입점 | 시나리오 정의 위치 | 새 도메인 추가 비용 |
+|---|---|---|---|
+| **A. spec.json 기반 (권장)** | `run_worker.py` (또는 `gateway.py`) | `spec.json`의 `ctx` / `questions` / `schema_block` 필드 | 코드 수정 없음 — JSON만 작성 |
+| **B. scenarios/ 디렉토리 기반 (prototype)** | `run_scenario.py` | `scenarios/<id>/context.md` + `question.md` + `viz.py` | `prompt_builder.py` `USER_TEMPLATE` 수정 동반 — exhibition 5질문 형식에 고정 |
+
+**Path A가 권장**입니다. `spec.json`에 응답 컨텍스트·질문·스키마를 직접 작성하면 LLM 호출·결과 누적·보고서 합성까지 자동 진행되며 신규 도메인은 코드 수정 없이 추가됩니다. 본 README의 "본격 측정" 섹션이 path A 흐름입니다.
+
+**Path B**는 본 저장소 첫 prototype인 `exhibition_appeal` 시나리오의 흐름을 보존한 것으로, [prompt_builder.py:71](backend/prompt_builder.py:71) `USER_TEMPLATE`이 `appeal_score`/`visit_intent`/`key_attraction`/`key_concern`/`reason` 5개 응답 키에 고정되어 있어 새 도메인을 추가하려면 코드도 함께 수정해야 합니다. `validate_prompt_schema()`는 path B에서 `question.md` ↔ `USER_TEMPLATE` drift만 검증하며, path A에는 적용되지 않습니다.
+
+아래 디렉토리 구조와 `context.md`·`question.md` 작성 원칙은 **path B (scenarios/) 한정**입니다. path A를 쓰는 분은 ["본격 측정"](#본격-측정--보고서인포그래픽까지) 섹션의 `spec.json` 양식만 따라가시면 됩니다.
+
+### 디렉토리 구조 (path B)
 
 ```
 scenarios/<your_scenario_id>/
@@ -203,21 +214,27 @@ run_dir/
 
 ```json
 {
-  "scenario_id": "exhibition_appeal",
-  "context_snapshot": "2026-04",
-  "topic": "전시 제목 또는 측정 주제",
-  "ctx": "(선택) context.md 외 추가 맥락",
-  "questions": "(선택) question.md 외 추가 질문",
-  "n_personas": 100,
+  "run_id": "20260501-002643-8c5981",
+  "owner": "kk1",
+  "created_at": "2026-05-01T00:26:43.510592",
+  "topic": "측정 주제 (한 줄 요약)",
+  "ctx": "응답자에게 제공할 배경 컨텍스트 본문",
+  "questions": "1) 첫 질문\n2) 두 번째 질문\n3) ...",
+  "schema_block": "{\n  \"q1_key\": {\"type\": \"integer\", \"scale\": \"1~5 Likert\", \"description\": \"...\"},\n  \"q2_key\": {\"type\": \"string\", \"options\": [\"...\"], \"description\": \"...\"}\n}",
+  "qgen_model": "openrouter/anthropic/claude-sonnet-4.6",
+  "report_model": "openrouter/anthropic/claude-opus-4.7",
+  "n": 100,
+  "seed": 42,
+  "filters": {},
   "models": [
     "openrouter/anthropic/claude-3.5-haiku",
     "openrouter/openai/gpt-4o-mini",
     "openrouter/x-ai/grok-4-fast"
-  ],
-  "report_model": "openrouter/anthropic/claude-opus-4-7",
-  "seed": 42
+  ]
 }
 ```
+
+필수 키: `run_id`, `n`, `models`. 나머지는 선택이지만 `topic`·`ctx`·`questions`·`schema_block`이 비어 있으면 응답 LLM에 전달할 컨텍스트와 형식 검증이 부실해진다. `created_at`은 ISO 8601 형식, `seed`는 양의 정수, `filters`는 페르소나 demographic 필터 dict (예: `{"province": "서울"}`).
 
 ### 실행
 

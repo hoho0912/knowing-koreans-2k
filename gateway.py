@@ -117,19 +117,38 @@ QGEN_MODEL_DEFAULT = "openrouter/anthropic/claude-sonnet-4.6"
 REPORT_MODEL_DEFAULT = "openrouter/anthropic/claude-opus-4.7"
 
 # 진행 중 phase 집합 (1단계 카드 / 동시성 정책 / 4단계 polling 분기)
-ACTIVE_PHASES = {"starting", "loading_pool", "sampling", "calling_llm", "writing_report"}
+ACTIVE_PHASES = {
+    "starting",
+    "loading_pool",
+    "sampling",
+    "calling_llm",
+    "writing_report",
+    # 인사이트 파이프라인 phase (run_worker.py v6.x)
+    "estimating_tokens",
+    "calling_insight_llm",
+    "analyzing_clusters",
+    "cross_cluster_diff",
+    "raw_retrieval",
+    "synthesizing",
+}
 
 # phase 한글 표기 — status.json의 phase 코드를 사용자 화면용 라벨로 매핑.
 # 매핑 누락 시 phase 코드 그대로 노출 → 영문이 그대로 보이는 사고 방지.
 PHASE_LABELS_KO = {
-    "starting":         "시작 중",
-    "loading_pool":     "페르소나 풀 불러오는 중",
-    "sampling":         "페르소나 표본 추출 중",
-    "calling_llm":      "응답 수집 중",
-    "writing_report":   "보고서 정리 중",
-    "done":             "완료",
-    "cancelled":        "취소됨",
-    "error":            "오류",
+    "starting":             "시작 중",
+    "loading_pool":         "페르소나 풀 불러오는 중",
+    "sampling":             "페르소나 표본 추출 중",
+    "calling_llm":          "응답 수집 중",
+    "writing_report":       "보고서 정리 중",
+    "estimating_tokens":    "토큰 추산 중",
+    "calling_insight_llm":  "분석 LLM 호출 중",
+    "analyzing_clusters":   "클러스터 분석 중",
+    "cross_cluster_diff":   "클러스터 비교 중",
+    "raw_retrieval":        "원본 발췌 중",
+    "synthesizing":         "보고서 합성 중",
+    "done":                 "완료",
+    "cancelled":            "취소됨",
+    "error":                "오류",
 }
 
 
@@ -263,8 +282,12 @@ def _cookies() -> CookieController:
 def _cookie_secret() -> bytes:
     raw = os.getenv("KK_COOKIE_SECRET", "")
     if not raw:
-        # 개발 환경 fallback — 운영에서는 .env에 반드시 셋업해야 함
-        return b"kk-dev-cookie-secret-change-me"
+        raise RuntimeError(
+            "KK_COOKIE_SECRET 환경변수가 설정되어 있지 않습니다. "
+            ".env.local에 다음 한 줄을 추가하세요:\n"
+            '    KK_COOKIE_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")\n'
+            "또는 직접 64자 hex 문자열을 생성해 셋업하세요."
+        )
     return raw.encode("utf-8")
 
 

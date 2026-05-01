@@ -2311,9 +2311,35 @@ def build_sources_zip(run_dir: Path) -> None:
 # 메인 흐름
 # ─────────────────────────────────────────────────────────
 
-def _append_result_row(result_path: Path, row: Dict[str, Any], header_written: bool) -> bool:
-    """단일 row를 result.csv에 append. 첫 호출은 header 포함."""
-    df = pd.DataFrame([row])
+def _build_result_columns(schema_block: str) -> List[str]:
+    """result.csv 컬럼 합집합을 schema_block에서 미리 결정.
+
+    success / failure row dict가 다른 키 집합을 갖기 때문에, 첫 호출이
+    failure로 시작하면 resp_* 컬럼이 헤더에서 누락되어 이후 success 행
+    응답이 잘려 들어간다. schema_block의 키를 미리 resp_<key>로 추가해
+    합집합 fieldnames로 to_csv columns= 에 명시하면 첫 행 결과와 무관하게
+    헤더가 항상 동일.
+    """
+    base = ["persona_uuid", "model_id", "ok", "elapsed_sec", "raw_json", "error"]
+    resp_keys: List[str] = []
+    if schema_block and schema_block.strip():
+        try:
+            schema = json.loads(schema_block)
+            if isinstance(schema, dict):
+                resp_keys = [f"resp_{k}" for k in schema.keys()]
+        except json.JSONDecodeError:
+            pass
+    return base + resp_keys
+
+
+def _append_result_row(
+    result_path: Path,
+    row: Dict[str, Any],
+    columns: List[str],
+    header_written: bool,
+) -> bool:
+    """단일 row를 result.csv에 append. columns로 모든 가능한 컬럼을 고정."""
+    df = pd.DataFrame([row], columns=columns)
     if not header_written:
         df.to_csv(result_path, index=False, encoding="utf-8")
         return True
@@ -2396,6 +2422,7 @@ def main(run_dir: Path) -> int:
         schema_block = spec.get("schema_block", "") or ""
         example_block = build_response_example(schema_block)
         result_path = run_dir / "result.csv"
+        result_columns = _build_result_columns(schema_block)
         header_written = False
         elapsed_total = 0.0
         n_done = 0
@@ -2443,7 +2470,7 @@ def main(run_dir: Path) -> int:
                     row["error"] = str(e)
                 t1 = time.monotonic()
                 elapsed_total += (t1 - t0)
-                header_written = _append_result_row(result_path, row, header_written)
+                header_written = _append_result_row(result_path, row, result_columns, header_written)
                 rows_buffer.append(row)
                 n_done += 1
                 if row.get("ok"):

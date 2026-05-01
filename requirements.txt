@@ -27,5 +27,7 @@ weasyprint>=60.0
 pypdfium2>=4.20.0
 Pillow>=10.0.0
 
-# (선택) Streamlit 게이트웨이 — gateway.py 실행 시에만 필요
+# (선택) Streamlit 게이트웨이 — gateway.py 실행 시에만 필요 (인증 + 쿠키 컨트롤러)
 streamlit>=1.30.0
+bcrypt>=4.0.0
+streamlit-cookies-controller>=0.0.5
