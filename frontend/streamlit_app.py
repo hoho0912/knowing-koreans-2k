@@ -11,7 +11,7 @@ import altair as alt
 import streamlit as st
 
 st.set_page_config(
-    page_title="knowing-koreans · 한국인 페르소나 시뮬레이터 — 전시 호감도",
+    page_title="knowing-koreans · 한국인 페르소나 시뮬레이터",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -30,15 +30,17 @@ df["age_bucket"] = pd.cut(
 )
 
 # ---------- 헤더 ----------
-st.title("knowing-koreans · 한국인 페르소나 시뮬레이터 — 전시 콘셉트 호감도")
-st.caption(
-    "한국 인구통계 합성 페르소나(NVIDIA Nemotron-Personas-Korea, 1M)에 "
-    "박물관·문화 시나리오를 던져 다중 LLM 응답을 비교하는 perspective-taking 도구."
+st.title("knowing-koreans · 한국인 페르소나 시뮬레이터")
+st.caption("합성 페르소나로 큐레이터 가설을 점검하는 도구.")
+st.markdown(
+    "한국 인구통계 분포 합성 페르소나(NVIDIA Nemotron-Personas-Korea, 약 700만)에 "
+    "박물관·문화 시나리오를 던져 여러 LLM이 어떻게 응답하는지 비교합니다. "
+    "이 페이지는 **첫 시나리오 prototype**의 응답을 시각화합니다."
 )
 st.caption(
-    f"시나리오: **exhibition_appeal** · 시점: **2026-04** · "
+    f"이 페이지의 사례 — **전시 콘셉트 호감도** (시점 **2026-04**) · "
     f"페르소나 **{df['persona_uuid'].nunique()}명** × 모델 **{df['model_short'].nunique()}개** "
-    f"= 응답 **{len(df)}건** (prototype)"
+    f"= 응답 **{len(df)}건** · prototype 차원"
 )
 
 # ---------- 전시 기획안 ----------
