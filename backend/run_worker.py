@@ -2457,7 +2457,7 @@ def main(run_dir: Path) -> int:
                     row["elapsed_sec"] = round(resp.elapsed_sec, 2)
                     row["raw_json"] = resp.text
                     try:
-                        parsed = json.loads(resp.text)
+                        parsed = parse_json_response(resp.text)
                         if isinstance(parsed, dict):
                             for k, v in parsed.items():
                                 row[f"resp_{k}"] = v

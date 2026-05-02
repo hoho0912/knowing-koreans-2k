@@ -279,7 +279,7 @@ python -m backend.run_worker backend/results/run_2026-05-01_my_scenario
 
 `gateway.py`는 측정 의뢰·진행률·산출물 다운로드를 위한 Streamlit UI입니다. **현재 비밀번호 인증이 켜져 있어 외부 연구자는 곧바로 동작하지 않습니다** — 본인 환경에서 쓰려면:
 
-1. 사용자 본인의 `.creds-kk.json`을 만들거나 (양식: `{"users": {"id": "password_hash"}}`)
+1. 사용자 본인의 `.creds-kk.json`을 만들거나 (양식: `{"<id>": "<bcrypt_hash>"}` — 최상위 dict, `id` 키로 직접 조회. 해시 생성: `python -c "import bcrypt; print(bcrypt.hashpw(b'<pw>', bcrypt.gensalt()).decode())"`)
 2. `gateway.py`의 인증 블록을 주석 처리해 비활성화
 
 다른 연구자에게는 `run_worker.py`를 직접 CLI로 실행하시기를 권합니다.
