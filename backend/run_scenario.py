@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.llm_runner import call_llm, parse_json_response
 from backend.persona_sampler import load_all_personas, sample_personas
-from backend.prompt_builder import build_prompt
+from backend.prompt_builder import build_prompt, validate_model_ids, validate_prompt_schema
 from backend.results_writer import (
     append_csv_row,
     build_result_row,
@@ -74,6 +74,11 @@ def run(
     scenario_dir = SCENARIOS_DIR / scenario_id
     if not scenario_dir.is_dir():
         raise FileNotFoundError(f"시나리오 폴더 없음: {scenario_dir}")
+
+    print("[0/4] 사전 검증 — schema drift / engine drift")
+    validate_prompt_schema(scenario_dir)
+    validate_model_ids(models)
+    print("      OK (question.md ↔ USER_TEMPLATE 일치, model_id prefix 모두 지원)")
 
     filter_desc = []
     if province:
