@@ -52,12 +52,12 @@ TRASH_RETENTION_DAYS = 30
 
 DEFAULT_SIM_MODELS = [
     "openrouter/qwen/qwen3-max",
-    "openrouter/nousresearch/hermes-4-405b",
+    "openrouter/nousresearch/hermes-4-70b",
     "openrouter/anthropic/claude-haiku-4.5",
 ]
 
 EXTRA_SIM_MODELS = [
-    "openrouter/nousresearch/hermes-4-70b",
+    "openrouter/nousresearch/hermes-4-405b",
     "openrouter/qwen/qwen3.6-max-preview",
     "openrouter/qwen/qwen3.6-plus",
     "openrouter/mistralai/mistral-large-2512",
@@ -622,7 +622,7 @@ with st.expander("ℹ️ 이 도구가 쓰는 AI 3종의 역할", expanded=False
         "2. **측정용 AI (페르소나 응답)** — 3단계에서 페르소나 1명당 1번씩, "
         "그 페르소나 입장에서 질문에 시나리오별 응답 항목 전수의 구조화 응답을 만듭니다. **여러 종을 동시에** "
         "돌려 모델별 응답 차이를 비교 시야로 보존합니다. 기본 3종은 페르소나 반영도 "
-        "사전 검증을 통과한 Qwen3 Max·Hermes 4 405B·Claude Haiku 4.5입니다. "
+        "사전 검증을 통과한 Qwen3 Max·Hermes 4 70B·Claude Haiku 4.5입니다. "
         "3단계 [▸ 고급]에서 추가/교체 가능합니다.\n"
         "3. **분석용 AI (통찰 정리)** — 5단계 직전, 수집된 모든 응답·페르소나 narrative를 "
         "한 번에 시야로 받아 큐레이터용 4섹션 보고서(핵심 발견·관점·인용·후속 질문)를 "
