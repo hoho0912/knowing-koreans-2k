@@ -1,0 +1,19 @@
+{
+  "run_id": "20260503-041511-08e5b6",
+  "owner": "kk1",
+  "topic_short": "2010년대 중반 이후 미술전시에서 전시를 해설하는 도",
+  "phase": "done",
+  "started_at": "2026-05-03T13:15:12.628044+09:00",
+  "updated_at": "2026-05-03T13:20:16.881677+09:00",
+  "n_total": 100,
+  "n_done": 100,
+  "n_ok": 100,
+  "n_fail": 0,
+  "avg_sec_per_call": 2.06,
+  "eta_sec": 0,
+  "report_ready": true,
+  "finished_at": "2026-05-03T13:20:16.881654+09:00",
+  "error": null,
+  "insight_mode": "A",
+  "insight_input_tokens": 381593
+}
