@@ -1,0 +1,217 @@
+/* knowing-koreans — Observable Framework 스타일 보완 */
+
+:root {
+  --kk-accent: #1f6feb;
+  --kk-accent-soft: #e6efff;
+  --kk-bg-soft: #f6f8fa;
+  --kk-border: #d0d7de;
+  --kk-quote-bg: #fff8e6;
+  --kk-quote-border: #f0c674;
+  --kk-card-bg: #ffffff;
+  --kk-muted: #57606a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --kk-accent: #58a6ff;
+    --kk-accent-soft: #1e2a44;
+    --kk-bg-soft: #1c2128;
+    --kk-border: #30363d;
+    --kk-quote-bg: #2a2310;
+    --kk-quote-border: #d4a72c;
+    --kk-card-bg: #161b22;
+    --kk-muted: #8b949e;
+  }
+}
+
+.lede {
+  font-size: 1.05rem;
+  line-height: 1.6;
+  color: var(--theme-foreground-muted);
+  margin: 0.5em 0 1.5em 0;
+  padding: 1em 1.2em;
+  background: var(--kk-bg-soft);
+  border-left: 4px solid var(--kk-accent);
+  border-radius: 4px;
+}
+
+.valid-n-callout {
+  display: inline-block;
+  padding: 0.3em 0.7em;
+  background: var(--kk-accent-soft);
+  color: var(--kk-accent);
+  border-radius: 4px;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+}
+
+.metrics-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.metric-card {
+  background: var(--kk-card-bg);
+  border: 1px solid var(--kk-border);
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+}
+
+.metric-card .metric-label {
+  font-size: 0.78rem;
+  color: var(--kk-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.metric-card .metric-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+  margin-top: 0.2em;
+}
+
+.metric-card .metric-sub {
+  font-size: 0.78rem;
+  color: var(--kk-muted);
+  margin-top: 0.15em;
+}
+
+.finding-card,
+.hypothesis-card,
+.quote-card,
+.response-card {
+  background: var(--kk-card-bg);
+  border: 1px solid var(--kk-border);
+  border-radius: 6px;
+  padding: 1rem 1.2rem;
+  margin: 0.75rem 0;
+}
+
+.finding-card .finding-label {
+  font-weight: 600;
+  color: var(--kk-accent);
+  margin-bottom: 0.3em;
+}
+
+.hypothesis-card .hypothesis-meta {
+  font-size: 0.85rem;
+  color: var(--kk-muted);
+  margin-bottom: 0.5em;
+}
+
+.hypothesis-card .hypothesis-meta code {
+  background: var(--kk-bg-soft);
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+}
+
+.quote-card blockquote {
+  margin: 0.5em 0;
+  padding: 0.6em 1em;
+  background: var(--kk-quote-bg);
+  border-left: 4px solid var(--kk-quote-border);
+  border-radius: 4px;
+  font-style: italic;
+}
+
+.quote-card .curator-note {
+  font-size: 0.9rem;
+  color: var(--kk-muted);
+  margin-top: 0.6em;
+}
+
+.response-card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.response-card .badge-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  align-items: center;
+  min-width: 80px;
+}
+
+.q1-badge {
+  display: inline-block;
+  width: 36px;
+  height: 36px;
+  line-height: 36px;
+  text-align: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+}
+
+.q1-badge.q1-1 { background: #b32424; }
+.q1-badge.q1-2 { background: #d97706; }
+.q1-badge.q1-3 { background: #6b7280; }
+.q1-badge.q1-4 { background: #2f7d32; }
+.q1-badge.q1-5 { background: #1f6feb; }
+
+.q1-label {
+  font-size: 0.75rem;
+  color: var(--kk-muted);
+  text-align: center;
+}
+
+.response-card .persona-attrs {
+  font-size: 0.85rem;
+  color: var(--kk-muted);
+  margin-bottom: 0.4em;
+}
+
+.response-card .persona-quote {
+  font-size: 0.95rem;
+  line-height: 1.55;
+  margin: 0;
+}
+
+.response-card .response-meta {
+  font-size: 0.78rem;
+  color: var(--kk-muted);
+  margin-top: 0.4em;
+}
+
+details.scenario-spec {
+  margin: 1rem 0;
+  padding: 0.6em 1em;
+  background: var(--kk-bg-soft);
+  border: 1px solid var(--kk-border);
+  border-radius: 6px;
+}
+
+details.scenario-spec > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+details.scenario-spec pre {
+  background: var(--kk-card-bg);
+  border: 1px solid var(--kk-border);
+  border-radius: 4px;
+  padding: 0.7em;
+  overflow-x: auto;
+  font-size: 0.82rem;
+}
+
+.next-question {
+  padding: 0.6em 0.9em;
+  background: var(--kk-bg-soft);
+  border-left: 3px solid var(--kk-accent);
+  border-radius: 4px;
+  margin: 0.4em 0;
+}
+
+.muted {
+  color: var(--kk-muted);
+  font-size: 0.85rem;
+}

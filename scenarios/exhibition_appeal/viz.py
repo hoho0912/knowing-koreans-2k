@@ -2,7 +2,7 @@
 exhibition_appeal — 시각화 차원 정의 (skeleton)
 
 이 파일은 시나리오의 응답 필드를 어떻게 시각화에 매핑할지 정의한다.
-실제 차트 코드는 frontend/index.html (stlite) 안에서 구현되며,
+실제 차트 코드는 frontend-obs/src/index.md (Observable Framework) 안에서 구현되며,
 이 파일은 시나리오 메타데이터만 노출한다.
 """
 

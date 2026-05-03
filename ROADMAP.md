@@ -25,14 +25,15 @@
 - OpenRouter API Key
 - 첫 시나리오 1차 자료 (가상 전시 기획안 또는 기존 도록 1~2건)
 
-## M2 — stlite 정적 사이트
+## M2 — Observable Framework 정적 사이트
 
 **산출물**
-- frontend/index.html — stlite 0.85.x + Plotly 정적 호스팅
-- frontend/data/exhibition_appeal_2026-04.csv 게시
-- frontend/scenarios/exhibition_appeal/context.md 노출용 사본
+- `frontend-obs/` — Observable Framework v1.13.4 (Markdown + JS + Python loader)
+- Python loader(`src/round1.json.py`)가 `frontend/data/run_N1000_*/` 산출물을 JSON으로 변환
 - 시나리오 셀렉터 UI (드롭다운 또는 탭, 단일 시나리오라도 미리 구조 잡음)
-- GitHub Pages 활성화 + 첫 배포
+- GitHub Pages 활성화 + 첫 배포 (`.github/workflows/deploy.yaml`)
+
+> v0.3.0(2026-05-03)에서 streamlit + stlite stack을 폐기하고 Observable Framework로 전환. 변경 이유: stlite는 Pyodide 부팅이 무거워 단일 결과 문서 노출에 부적합. Observable Framework는 Markdown 기반 + 정적 빌드라 GitHub Pages 정합도 좋음.
 
 ## M3 — 시나리오 2~3개 추가 + 페르소나 깊이 Stage 2
 
