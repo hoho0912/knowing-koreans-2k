@@ -565,5 +565,6 @@ ${nextQs.length === 0 ? html`<div class="muted">next_questions 비어 있음</di
 ---
 
 <div class="muted">
-knowing-koreans · run_id <code>${meta.run_id || "-"}</code> · 데이터: NVIDIA Nemotron-Personas-Korea (CC BY 4.0) · OpenRouter 경유 다중 LLM · Observable Framework 정적 호스팅
+knowing-koreans · <strong>v0.3.1</strong> · 2026-05-04 · run_id <code>${meta.run_id || "-"}</code><br>
+데이터: NVIDIA Nemotron-Personas-Korea (CC BY 4.0) · OpenRouter 경유 다중 LLM · Observable Framework 정적 호스팅
 </div>

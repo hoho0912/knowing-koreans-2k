@@ -11,6 +11,15 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 ## 버전 / 변경 이력
 
 
+### v0.3.1 · 2026-05-04 — 보고서 구조 ①~⑧ 재정렬 + 분석 표 LLM 자율 결정
+
+- 보고서 합성 LLM 산출물을 5섹션 JSON으로 재설계 (`analysis_tables` / `key_findings` / `curator_hypotheses` / `responses_to_chew_on` / `next_questions`)
+- 분석 표(③ 섹션)는 보고서 합성 LLM이 응답 schema(질문 type)와 raw 응답을 직접 보고 표 종류·축·집계 방식을 자율 결정 — type 분기 하드코딩 제거
+- frontend-obs 보고서 페이지 구조를 ①~⑧로 재정렬 (① 핵심 분포 / ② 교차분석 / ③ 분석 표 / ④ 발견 패턴 / ⑤ 곱씹을 만한 응답 / ⑥ 응답 카드 / ⑦ 큐레이터 가설 / ⑧ 다음에 던져볼 질문)
+- 다크 모드 H2 청색 밑줄 fix — Framework `--theme-foreground-alt` CSS 변수 override
+- footer/sidebar/toc/pager/search Framework 기본값 비활성화로 보고서 본문에 집중
+- schema 타입 분기를 `likert_5` / `likert_7` / `single_choice` / `free_text` 4종으로 일반화 — 신규 시나리오 추가 시 코드 수정 불필요
+
 ### v0.3.0 · 2026-05-03 — Observable Framework 도입 + 차트 정렬
 
 - 시각화 stack을 streamlit + stlite에서 Observable Framework v1.13.4로 전환 (`frontend-obs/`)
@@ -110,16 +119,18 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 
 → https://hoho0912.github.io/knowing-koreans-2k/
 
-페이지는 Observable Framework 기반의 정적 사이트로, Python loader가 빌드 시점에 측정 산출물을 JSON으로 변환하고 브라우저에서는 D3 + Plot으로 차트를 렌더링합니다. 현재 페이지에서는 **본 라운드 N=1,000 단면**(박물관 관람료 유료화 도입 논쟁 시나리오, 응답 성공 998건) 한 건만 공개하며, 보고서 본문(측정 개요·한눈에 보기 차트·핵심 발견·큐레이터 관점·축별 분포·곱씹을 만한 응답·다음 질문·부록)을 그대로 노출합니다. 1차 prototype 25건(전시 콘셉트 호감도 시나리오)은 도구 동작 확인용 사전 측정이라 본 저장소의 측정 라운드 표(아래)에 이력만 남겨 두고, 결과 소개 페이지에는 노출하지 않습니다.
+페이지는 Observable Framework 기반의 정적 사이트로, Python loader가 빌드 시점에 측정 산출물을 JSON으로 변환하고 브라우저에서는 D3 + Plot으로 차트를 렌더링합니다. 현재 페이지에서는 **본 라운드 N=1,000 단면**(박물관 관람료 유료화 도입 논쟁 시나리오, 응답 성공 998건) 한 건을 ①~⑧ 섹션 구조로 공개합니다. 1차 prototype 25건(전시 콘셉트 호감도 시나리오)은 도구 동작 확인용 사전 측정이라 본 저장소의 측정 라운드 표(아래)에 이력만 남겨 두고, 결과 소개 페이지에는 노출하지 않습니다.
 
 | 영역 | 내용 |
 |---|---|
-| ⑦ 발견 패턴 (key findings) | 보고서 LLM이 998건 raw 응답을 10개 cluster로 분석한 뒤 종합한 6개 패턴 (전체 분포 / ambivalence / 대안 우선 합의 / 연령·학력·지역 nuance / narrative 부정합 / 약신호) |
-| ⑧ 큐레이터 관점·가설 | 발견 패턴을 도메인 어조로 옮긴 5개 가설 (타깃 그룹·전달 형식·메시지 본문 3차원) |
-| ⑨ 차트 5장 | 페르소나 연령·지역 분포 + 응답 분포(전체·인구통계 축별·모델별) |
-| ⑩ 곱씹을 만한 응답 | 998건 응답 중 큐레이터에게 의미 있는 인용 3건 + 큐레이션 활용 노트 |
-| ⑪ 다음에 던져볼 질문 | 본 라운드 약신호·모델 편향 의심 패턴을 후속 시나리오로 옮긴 5개 work item |
-| ⑫ 보고서 전문 | 보고서 PDF 다운로드 + Markdown 전문 expander |
+| ① 핵심 분포 | 질문별 응답 빈도 — Likert는 100% 누적 막대 + 한국어 라벨, 옵션 선택형은 lollipop, 자유서술은 키워드 매칭 빈도 lollipop |
+| ② 교차분석 | 페르소나 demographic 축(연령·성별·수도권·학력·17개 시도·직업 top 12)별 핵심 응답 분포 — 그룹 내 비율 100% 누적 막대 |
+| ③ 분석 표 | 보고서 합성 LLM이 응답 schema와 raw 응답을 보고 표 종류·축·집계 방식을 자율 결정한 분석 표 (측정마다 표 구성이 달라짐) |
+| ④ 발견 패턴 | 보고서 합성 LLM이 valid 응답 + cluster 분석 + cross-cluster diff + synthesis 단계로 도출한 패턴 (전체 분포 / ambivalence / 대안 우선 합의 / 연령·학력·지역 nuance / narrative 부정합 / 약신호 등) |
+| ⑤ 곱씹을 만한 응답 | valid 응답 중 큐레이터에게 의미 있는 인용 3건 + 큐레이션 활용 노트 |
+| ⑥ 응답 카드 | 핵심 응답 1~5 각 구간에서 valid 응답 최대 6건씩 시드 고정 샘플 (Q 응답 필터 인터랙션 포함, 자유서술은 240자 컷) |
+| ⑦ 큐레이터 가설 | 발견 패턴을 큐레이터 도메인 어조로 옮긴 가설 후보 (타깃 그룹·전달 형식·메시지 본문 3차원) |
+| ⑧ 다음에 던져볼 질문 | 본 라운드 약신호와 모델 편향 의심 패턴을 후속 시나리오 질문으로 옮긴 큐레이터용 work item |
 
 ---
 
