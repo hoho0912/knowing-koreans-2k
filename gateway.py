@@ -24,12 +24,15 @@ import subprocess
 import sys
 import textwrap
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+KST = timezone(timedelta(hours=9))
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import bcrypt
 import streamlit as st
+import streamlit.components.v1 as st_components  # noqa: F401  # Observable iframe 임베드용
 from streamlit_cookies_controller import CookieController
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -899,10 +902,18 @@ elif step == 3:
         education_level = st.text_input("교육 수준", value="")
         occupation = st.text_input("직업 (정확 일치)", value="")
 
+    STRATIFY_LABELS = {
+        "(없음 — 단순 무작위)": "(없음 — 단순 무작위)",
+        "province": "지역 (province)",
+        "age_bucket": "연령대 (age_bucket)",
+        "sex": "성별 (sex)",
+    }
     stratify_choice = st.selectbox(
         "균등 추출 차원 (선택)",
-        ["(없음 — 단순 무작위)", "province", "age_bucket", "sex"],
-        help="‘없음’이면 단순 무작위. 차원을 고르면 그 차원으로 그룹을 나눠 N/그룹씩 균등 추출.",
+        list(STRATIFY_LABELS.keys()),
+        format_func=lambda v: STRATIFY_LABELS[v],
+        help="‘없음’이면 단순 무작위. 차원을 고르면 그 차원으로 그룹을 나눠 페르소나 N명을 "
+             "그룹별로 균등 분배해 뽑습니다 (예: 연령대 5단계라면 N/5명씩).",
     )
 
     st.subheader("측정용 AI 모델 (페르소나 응답을 만드는 AI)")
@@ -1023,7 +1034,7 @@ elif step == 3:
         spec = {
             "run_id": run_id,
             "owner": OWNER,
-            "created_at": datetime.now().isoformat(),
+            "created_at": datetime.now(KST).isoformat(),
             "topic": st.session_state.topic_text,
             "ctx": st.session_state.ctx,
             "questions": st.session_state.questions,
@@ -1205,31 +1216,53 @@ elif step == 5:
             st.rerun()
         st.stop()
 
-    report_png = run_dir / "report.png"
-    report_pdf = run_dir / "report.pdf"
+    obs_dir = run_dir / "observable"
+    obs_index = obs_dir / "index.html"
+    report_pdf_obs = run_dir / "report_obs.pdf"
+    report_pdf_legacy = run_dir / "report.pdf"
     sources_zip = run_dir / "sources.zip"
+    report_md_path = run_dir / "report.md"
 
     st.write(
         "AI가 응답 전체를 읽고, 큐레이터가 미처 떠올리지 못했을 만한 관점·가설을 "
-        "정리한 보고서입니다."
+        "정리한 인터랙티브 보고서입니다."
     )
 
-    if report_png.exists():
-        st.image(str(report_png), use_container_width=True)
+    # 시각화 — Observable Framework 빌드 산출물(observable/index.html)을 iframe으로 임베드.
+    # streamlit이 정적 파일을 직접 서빙하지 못하므로, 같은 origin 의 nginx 가
+    # /runs/<run_id>/observable/ 경로를 run_dir/observable/ 디렉토리로 alias 해야 한다.
+    # KK_PUBLIC_BASE_URL 환경변수로 base 를 지정할 수 있으며, 비어 있으면 같은 origin 의
+    # 상대 경로로 만든다. 정적 alias 가 없으면 iframe 이 빈 화면이 되므로
+    # report.md fallback 도 함께 노출한다.
+    if obs_index.exists():
+        public_base = os.environ.get("KK_PUBLIC_BASE_URL", "").rstrip("/")
+        iframe_src = f"{public_base}/runs/{run_id}/observable/" if public_base else f"/runs/{run_id}/observable/"
+        # iframe 높이 — 본 라운드 시각화 한 페이지를 모두 보여주기 위해 1600px 정도.
+        # 사용자 화면이 더 작으면 streamlit container 가 가로 스크롤로 흡수.
+        st.components.v1.iframe(iframe_src, height=1600, scrolling=True)
+    elif report_md_path.exists():
+        st.warning(
+            "Observable 빌드 산출물이 없어 보고서 마크다운으로 표시합니다. "
+            "(서버 환경에 Node.js·npx 가 설치되어 있는지 확인해 주세요.)"
+        )
+        st.markdown(report_md_path.read_text(encoding="utf-8"))
     else:
-        # PDF/PNG 렌더가 실패한 경우 마크다운 fallback
-        report_md = run_dir / "report.md"
-        if report_md.exists():
-            st.markdown(report_md.read_text(encoding="utf-8"))
-        else:
-            st.error("보고서 파일을 찾을 수 없습니다.")
+        st.error("보고서 파일을 찾을 수 없습니다.")
 
     col_pdf, col_zip = st.columns(2)
     with col_pdf:
-        if report_pdf.exists():
+        # PDF는 갈래 C-β의 신규 경로(report_obs.pdf — Observable HTML → playwright)를 우선
+        # 시도하고, 없으면 옛 weasyprint 경로(report.pdf)로 fallback.
+        pdf_path: Optional[Path] = None
+        if report_pdf_obs.exists():
+            pdf_path = report_pdf_obs
+        elif report_pdf_legacy.exists():
+            pdf_path = report_pdf_legacy
+
+        if pdf_path is not None:
             st.download_button(
                 "보고서 PDF 다운로드",
-                data=report_pdf.read_bytes(),
+                data=pdf_path.read_bytes(),
                 file_name=f"{run_id}_report.pdf",
                 mime="application/pdf",
                 use_container_width=True,

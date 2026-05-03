@@ -356,8 +356,11 @@ def _format_kst_date(created_at: str, with_time: bool = False) -> str:
         s = created_at.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            # spec.created_at에 timezone 정보 없는 경우 KST로 가정
-            dt = dt.replace(tzinfo=KST)
+            # spec.created_at에 timezone 정보가 없으면 UTC로 간주.
+            # (과거 측정은 datetime.now().isoformat() 으로 KVM 로컬타임을
+            #  naive하게 기록 — KVM은 UTC tz라 결과적으로 UTC 기준이 맞다.
+            #  현재 측정부터는 gateway가 KST aware로 기록.)
+            dt = dt.replace(tzinfo=timezone.utc)
         kst_dt = dt.astimezone(KST)
         return kst_dt.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
     except Exception:
@@ -379,9 +382,13 @@ def compose_header(
     lines.append("")
     if topic_short:
         lines.append(f"**시나리오**: {topic_short}")
+        lines.append("")
     if date_str:
         lines.append(f"**측정일**: {date_str}")
-    lines.append(f"**규모**: AI 페르소나 {n_personas}명 × {n_models}개 모델 → 응답 {n_responses}건")
+        lines.append("")
+    lines.append(
+        f"**규모**: AI 페르소나 {n_personas}명 × {n_models}개 모델 → 응답 {n_responses}건"
+    )
     lines.append("")
     lines.append(
         "본 보고서는 응답자 속성(연령·학력·지역·성별·혼인 등)을 분류 축으로 "
@@ -393,753 +400,15 @@ def compose_header(
 
 
 # ─────────────────────────────────────────────────────────
-# 인포그래픽 — 보고서 종합서술 영역에 임베드되는 PNG 차트 3종
-#   (1) 호감도 막대 + 방문 의향
-#   (2) 연령대 × 성별 피라미드
-#   (3) 한국 시·도 단위 페르소나 분포 choropleth
-# matplotlib만 사용 — geopandas/shapely 의존성 회피.
+# 보고서 시각화는 Observable Framework 빌드 산출물(observable/)이 SSOT.
+# 옛 matplotlib 차트 함수(_setup_korean_font, render_appeal_chart,
+# render_age_pyramid, render_korea_map, render_response_distribution,
+# render_response_by_axis, render_response_by_model, render_overview_charts,
+# _detect_response_columns, _select_primary_response_col,
+# _likert_labels_from_scale, _classify_urban)는 frontend-obs/src/data/scenario.json.py
+# + frontend-obs/src/index.md 로 이전. 본 모듈에서는 측정 결과를 run_dir 에 저장만
+# 한 뒤 npx observable build 를 호출해 정적 사이트(observable/index.html)를 생성한다.
 # ─────────────────────────────────────────────────────────
-
-def _setup_korean_font() -> Optional[str]:
-    """matplotlib에 한국어 폰트 설정. 시스템에 설치된 Noto/Nanum 계열 자동 탐지."""
-    import matplotlib  # type: ignore
-    matplotlib.use("Agg")
-    import matplotlib.font_manager as fm  # type: ignore
-    import matplotlib.pyplot as plt  # type: ignore
-
-    candidates = (
-        "Noto Sans CJK KR", "Noto Sans KR",
-        "NanumGothic", "Nanum Gothic",
-        "Malgun Gothic", "AppleGothic",
-        # Debian/Ubuntu .ttc는 default subfamily(JP)만 인덱스되지만
-        # KR 글리프도 같은 파일에 들어 있어 'JP' 이름으로도 한글 렌더 가능
-        "Noto Sans CJK JP",
-    )
-    available = {f.name for f in fm.fontManager.ttflist}
-    for name in candidates:
-        if name in available:
-            plt.rcParams["font.family"] = name
-            plt.rcParams["axes.unicode_minus"] = False
-            return name
-    # 부분 매칭 fallback
-    for f in fm.fontManager.ttflist:
-        if "CJK" in f.name:
-            plt.rcParams["font.family"] = f.name
-            plt.rcParams["axes.unicode_minus"] = False
-            return f.name
-    plt.rcParams["axes.unicode_minus"] = False
-    return None
-
-
-def render_appeal_chart(df_result: pd.DataFrame, png_path: Path) -> bool:
-    """호감도(1~5) + 방문 의향(yes/maybe/no) 가로 정렬 막대.
-
-    resp_appeal_score / resp_visit_intent 컬럼이 둘 다 없으면 그리지 않음.
-    """
-    appeal_col = "resp_appeal_score"
-    visit_col = "resp_visit_intent"
-    has_appeal = appeal_col in df_result.columns
-    has_visit = visit_col in df_result.columns
-    if not (has_appeal or has_visit):
-        return False
-
-    import matplotlib.pyplot as plt  # type: ignore
-
-    panels = sum([has_appeal, has_visit])
-    fig, axes = plt.subplots(1, panels, figsize=(5 * panels, 4))
-    if panels == 1:
-        axes = [axes]
-
-    idx = 0
-    if has_appeal:
-        ax = axes[idx]; idx += 1
-        appeal = pd.to_numeric(df_result[appeal_col], errors="coerce").dropna().astype(int)
-        counts = {k: int((appeal == k).sum()) for k in range(1, 6)}
-        keys = list(counts.keys())
-        vals = [counts[k] for k in keys]
-        bars = ax.bar([str(k) for k in keys], vals, color="#4a7ab8")
-        ax.set_title("호감도 분포 (1~5점)")
-        ax.set_xlabel("점수")
-        ax.set_ylabel("응답 수")
-        for b, v in zip(bars, vals):
-            if v > 0:
-                ax.text(b.get_x() + b.get_width() / 2, v, str(v),
-                        ha="center", va="bottom", fontsize=9)
-
-    if has_visit:
-        ax = axes[idx]; idx += 1
-        visit = df_result[visit_col].astype(str).str.strip().str.lower()
-        order = [("yes", "방문하겠다"), ("maybe", "글쎄/조건부"), ("no", "안 가겠다")]
-        vals = [int((visit == k).sum()) for k, _ in order]
-        labels = [lab for _, lab in order]
-        colors = ["#4caf50", "#ffb300", "#e53935"]
-        bars = ax.bar(labels, vals, color=colors)
-        ax.set_title("방문 의향")
-        ax.set_ylabel("응답 수")
-        for b, v in zip(bars, vals):
-            if v > 0:
-                ax.text(b.get_x() + b.get_width() / 2, v, str(v),
-                        ha="center", va="bottom", fontsize=9)
-
-    plt.tight_layout()
-    fig.savefig(png_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-def render_age_pyramid(df_personas: pd.DataFrame, png_path: Path) -> bool:
-    """페르소나 연령대 × 성별 피라미드 (좌 남자 / 우 여자)."""
-    if "age_bucket" not in df_personas.columns or "sex" not in df_personas.columns:
-        return False
-
-    import matplotlib.pyplot as plt  # type: ignore
-    import numpy as np  # type: ignore
-
-    male = []
-    female = []
-    for age in AGE_BUCKET_ORDER:
-        mask = df_personas["age_bucket"].astype(str) == age
-        male.append(int(((df_personas["sex"].astype(str) == "남자") & mask).sum()))
-        female.append(int(((df_personas["sex"].astype(str) == "여자") & mask).sum()))
-
-    if sum(male) + sum(female) == 0:
-        return False
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    y = np.arange(len(AGE_BUCKET_ORDER))
-    ax.barh(y, [-m for m in male], height=0.7, color="#5b8def", label="남자")
-    ax.barh(y, female, height=0.7, color="#ef7c8e", label="여자")
-    for yi, (m, f) in enumerate(zip(male, female)):
-        if m > 0:
-            ax.text(-m - 1, yi, str(m), va="center", ha="right", fontsize=9)
-        if f > 0:
-            ax.text(f + 1, yi, str(f), va="center", ha="left", fontsize=9)
-    ax.set_yticks(y)
-    ax.set_yticklabels(AGE_BUCKET_ORDER)
-    ax.set_xlabel("페르소나 수")
-    ax.set_title("페르소나 연령대 × 성별 분포")
-    xticks = ax.get_xticks()
-    ax.set_xticklabels([str(abs(int(x))) for x in xticks])
-    ax.legend(loc="lower right")
-    ax.axvline(0, color="black", linewidth=0.5)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-    fig.savefig(png_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-def render_korea_map(df_personas: pd.DataFrame, png_path: Path) -> bool:
-    """한국 17개 시·도 단위 페르소나 분포 choropleth.
-
-    geopandas/shapely 의존 없이 GeoJSON을 json으로 직접 파싱하고
-    matplotlib Polygon patch로 그림. 시·도 이름은 PROVINCE_TO_GEO로 매핑.
-    """
-    if "province" not in df_personas.columns:
-        return False
-    geo_path = ASSETS_DIR / "skorea-provinces-2018-geo.json"
-    if not geo_path.exists():
-        return False
-
-    import json as _json
-    import matplotlib.pyplot as plt  # type: ignore
-    from matplotlib.patches import Polygon as MplPolygon  # type: ignore
-    from matplotlib.collections import PatchCollection  # type: ignore
-    from matplotlib.colors import Normalize  # type: ignore
-    from matplotlib import cm  # type: ignore
-
-    counts_by_geo: Dict[str, int] = {}
-    vc = df_personas["province"].astype(str).value_counts()
-    for prov, cnt in vc.items():
-        geo_name = PROVINCE_TO_GEO.get(str(prov))
-        if geo_name:
-            counts_by_geo[geo_name] = counts_by_geo.get(geo_name, 0) + int(cnt)
-
-    if not counts_by_geo:
-        return False
-
-    geo = _json.loads(geo_path.read_text(encoding="utf-8"))
-    fig, ax = plt.subplots(figsize=(7.5, 8))
-    cmap = cm.get_cmap("YlOrRd")
-    max_cnt = max(counts_by_geo.values()) or 1
-    norm = Normalize(vmin=0, vmax=max_cnt)
-
-    def _ring_xy(ring):
-        xs = [pt[0] for pt in ring]
-        ys = [pt[1] for pt in ring]
-        return xs, ys
-
-    for ft in geo.get("features", []):
-        name = ft.get("properties", {}).get("name", "")
-        cnt = counts_by_geo.get(name, 0)
-        color = cmap(norm(cnt))
-        geom = ft.get("geometry", {})
-        gtype = geom.get("type", "")
-        coords = geom.get("coordinates", [])
-        polys: list = []
-        if gtype == "Polygon":
-            polys = [coords]
-        elif gtype == "MultiPolygon":
-            polys = coords
-        else:
-            continue
-
-        patches = []
-        biggest_ring = None
-        biggest_area = -1.0
-        for poly in polys:
-            if not poly:
-                continue
-            outer = poly[0]
-            patches.append(MplPolygon(outer, closed=True))
-            xs, ys = _ring_xy(outer)
-            x_extent = (max(xs) - min(xs)) if xs else 0
-            y_extent = (max(ys) - min(ys)) if ys else 0
-            area_proxy = x_extent * y_extent
-            if area_proxy > biggest_area:
-                biggest_area = area_proxy
-                biggest_ring = outer
-
-        if patches:
-            pc = PatchCollection(patches, facecolor=color, edgecolor="white", linewidths=0.6)
-            ax.add_collection(pc)
-
-        if biggest_ring is not None:
-            xs, ys = _ring_xy(biggest_ring)
-            cx = sum(xs) / len(xs)
-            cy = sum(ys) / len(ys)
-            short = (
-                name.replace("특별자치도", "")
-                    .replace("특별자치시", "")
-                    .replace("특별시", "")
-                    .replace("광역시", "")
-                    .replace("도", "")
-            )
-            label = f"{short}\n{cnt}" if cnt > 0 else short
-            alpha = 1.0 if cnt > 0 else 0.5
-            ax.text(cx, cy, label, ha="center", va="center",
-                    fontsize=8, alpha=alpha)
-
-    ax.set_aspect("equal")
-    ax.set_xlim(124.5, 132.0)
-    ax.set_ylim(33.0, 39.0)
-    ax.axis("off")
-    total_n = sum(counts_by_geo.values())
-    ax.set_title(f"페르소나 거주지 분포 (시·도, 총 {total_n}명)")
-    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.6)
-    cbar.set_label("페르소나 수")
-    plt.tight_layout()
-    fig.savefig(png_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-# ─────────────────────────────────────────────────────────
-# 응답 결과 시각화 — 시나리오 무관 자동 검출 패턴
-# 보고서 종합서술 영역에 임베드되는 차트 3종:
-#   D. 응답 항목별 분포 막대 (numeric/categorical 자동 grid)
-#   E. 핵심 응답 × axis(연령대·성별·거주권역) 교차
-#   F. 핵심 응답 × 모델 비교
-# spec.schema_block 자동 파싱 — 응답 schema 변해도 동작.
-# ─────────────────────────────────────────────────────────
-
-def _detect_response_columns(
-    spec: Dict[str, Any],
-    df_result: pd.DataFrame,
-) -> Dict[str, Dict[str, Any]]:
-    """spec.schema_block + df_result 컬럼 교차해 응답 컬럼 메타 추출.
-
-    반환: {"resp_<key>": {q_key, type_class, options, scale_range, description}}
-      type_class: "numeric" | "categorical" | "freetext"
-    """
-    schema_block = spec.get("schema_block", "")
-    try:
-        schema = json.loads(schema_block) if isinstance(schema_block, str) else schema_block
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(schema, dict):
-        return {}
-
-    detected: Dict[str, Dict[str, Any]] = {}
-    for q_key, q_def in schema.items():
-        col = f"resp_{q_key}"
-        if col not in df_result.columns or not isinstance(q_def, dict):
-            continue
-        t = q_def.get("type", "")
-        options = q_def.get("options") or q_def.get("enum")
-        scale = q_def.get("scale", "")
-        min_length = q_def.get("min_length")
-        desc = q_def.get("description", "") or ""
-
-        if t == "integer" or "Likert" in str(scale) or "likert" in str(scale).lower():
-            type_class = "numeric"
-            scale_range = (1, 5)
-            m = re.search(r"(\d+)\s*[-~]\s*(\d+)", str(scale))
-            if m:
-                scale_range = (int(m.group(1)), int(m.group(2)))
-        elif options and isinstance(options, list) and len(options) > 0:
-            type_class = "categorical"
-            scale_range = None
-        elif t == "string" and (min_length or "자유" in desc or "서술" in desc):
-            type_class = "freetext"
-            scale_range = None
-        else:
-            type_class = "categorical" if options else "freetext"
-            scale_range = None
-
-        likert_labels = _likert_labels_from_scale(scale) if type_class == "numeric" else None
-
-        detected[col] = {
-            "q_key": q_key,
-            "type_class": type_class,
-            "options": options if isinstance(options, list) else None,
-            "scale_range": scale_range,
-            "description": desc,
-            "scale_text": str(scale) if scale else "",
-            "likert_labels": likert_labels,
-        }
-    return detected
-
-
-def _select_primary_response_col(
-    spec: Dict[str, Any],
-    detected: Dict[str, Dict[str, Any]],
-) -> Optional[str]:
-    """E·F 차트의 핵심 응답 컬럼 자동 선택.
-
-    우선순위: spec["primary_outcome_col"] → 첫 numeric → 첫 categorical → None.
-    """
-    primary = spec.get("primary_outcome_col")
-    if primary and primary in detected:
-        return primary
-    for col, meta in detected.items():
-        if meta["type_class"] == "numeric":
-            return col
-    for col, meta in detected.items():
-        if meta["type_class"] == "categorical":
-            return col
-    return None
-
-
-def _likert_labels_from_scale(scale: Any) -> Optional[List[str]]:
-    """schema의 scale 문구 → 5점 Likert 한글 라벨 list.
-
-    1) 흔한 한국어 Likert 5종 (찬반·동의·만족·중요·빈도) 패턴 매칭 — 매칭되면 5점 모두 한글
-    2) 매칭 실패 시 정규식으로 '1=...', '3=...', '5=...' 추출 — 1·3·5만 한글, 2·4는 숫자
-    3) 둘 다 실패 → None (호출부에서 숫자 사용)
-    """
-    if not isinstance(scale, str) or not scale.strip():
-        return None
-    s = scale
-
-    if "반대" in s and "찬성" in s:
-        return ["매우\n반대", "반대", "중립", "찬성", "매우\n찬성"]
-    if "그렇지" in s and "그렇다" in s:
-        return ["전혀\n아니다", "아니다", "보통", "그렇다", "매우\n그렇다"]
-    if "만족" in s and ("불만" in s or "매우" in s):
-        return ["매우\n불만족", "불만족", "보통", "만족", "매우\n만족"]
-    if "중요" in s and ("않" in s or "전혀" in s):
-        return ["전혀\n중요\nX", "중요\n낮음", "보통", "중요", "매우\n중요"]
-    if ("빈도" in s or "자주" in s) and ("없" in s or "않" in s):
-        return ["전혀\n없음", "거의\n없음", "가끔", "자주", "매우\n자주"]
-
-    matches = dict(re.findall(r"(\d)\s*=\s*([^,)]+?)(?=\s*[,)]|$)", s))
-    if "1" in matches and "5" in matches:
-        def _short(t: str, n: int = 10) -> str:
-            t = t.strip().rstrip(".")
-            return t if len(t) <= n else t[:n] + "…"
-        l1 = _short(matches["1"])
-        l5 = _short(matches["5"])
-        l3 = _short(matches.get("3", "")) if matches.get("3", "").strip() else "3"
-        return [l1, "2", l3, "4", l5]
-
-    return None
-
-
-def _classify_urban(province: Any) -> str:
-    """페르소나 province → 도시규모 3분류 (단축형/풀형 둘 다 흡수)."""
-    if not isinstance(province, str):
-        return "그 외"
-    if province in ("서울", "서울특별시", "경기", "경기도", "인천", "인천광역시"):
-        return "수도권"
-    if province in (
-        "부산", "부산광역시", "대구", "대구광역시", "광주", "광주광역시",
-        "대전", "대전광역시", "울산", "울산광역시",
-    ):
-        return "광역시"
-    return "그 외"
-
-
-def render_response_distribution(
-    df_result: pd.DataFrame,
-    response_schema: Dict[str, Dict[str, Any]],
-    png_path: Path,
-) -> bool:
-    """D. 응답 항목별 분포 막대 — numeric은 점수 빈도, categorical은 옵션별 빈도."""
-    plot_cols = [
-        (c, m) for c, m in response_schema.items()
-        if m["type_class"] in ("numeric", "categorical")
-    ]
-    if not plot_cols:
-        return False
-
-    import matplotlib.pyplot as plt  # type: ignore
-
-    n = len(plot_cols)
-    if n == 1:
-        rows, cols = 1, 1
-    elif n <= 2:
-        rows, cols = 1, 2
-    elif n <= 4:
-        rows, cols = 2, 2
-    elif n <= 6:
-        rows, cols = 2, 3
-    elif n <= 9:
-        rows, cols = 3, 3
-    else:
-        rows, cols = 3, 4
-
-    fig, axes_obj = plt.subplots(rows, cols, figsize=(5 * cols, 3.5 * rows))
-    if rows * cols == 1:
-        axes = [axes_obj]
-    else:
-        axes = list(axes_obj.ravel())
-
-    for idx, (col, meta) in enumerate(plot_cols):
-        ax = axes[idx]
-        s = df_result[col].dropna()
-        title = (meta.get("description") or meta["q_key"])[:48]
-
-        if s.empty:
-            ax.text(0.5, 0.5, "데이터 없음", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(title, fontsize=11)
-            continue
-
-        if meta["type_class"] == "numeric":
-            scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
-            s_int = pd.to_numeric(s, errors="coerce").dropna().round().astype(int)
-            xs = list(range(scale_lo, scale_hi + 1))
-            ys = [int((s_int == k).sum()) for k in xs]
-            mean_v = float(s_int.mean()) if len(s_int) else 0.0
-            ax.bar(xs, ys, color="#5b8def", edgecolor="white")
-            ax.set_xticks(xs)
-            likert = meta.get("likert_labels")
-            if likert and len(likert) == (scale_hi - scale_lo + 1):
-                ax.set_xticklabels(likert, fontsize=8)
-            ax.set_xlabel(f"{meta['q_key']} (평균 {mean_v:.2f})", fontsize=9)
-            ax.set_ylabel("응답 수", fontsize=9)
-            for x, y in zip(xs, ys):
-                if y > 0:
-                    ax.text(x, y, str(y), ha="center", va="bottom", fontsize=8)
-        else:
-            options = meta.get("options") or sorted([str(v) for v in s.unique()])
-            counts = {opt: int((s.astype(str) == str(opt)).sum()) for opt in options}
-            labels = [str(opt)[:18] for opt in counts.keys()]
-            ys = list(counts.values())
-            ax.barh(range(len(labels)), ys, color="#ef7c8e", edgecolor="white")
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels(labels, fontsize=9)
-            ax.invert_yaxis()
-            ax.set_xlabel("응답 수", fontsize=9)
-            for i, y in enumerate(ys):
-                if y > 0:
-                    ax.text(y, i, f" {y}", va="center", fontsize=8)
-
-        ax.set_title(title, fontsize=10)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    for idx in range(len(plot_cols), len(axes)):
-        axes[idx].set_visible(False)
-
-    fig.suptitle("응답 항목별 분포", fontsize=13, y=0.995)
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-def render_response_by_axis(
-    df_personas: pd.DataFrame,
-    df_result: pd.DataFrame,
-    response_schema: Dict[str, Dict[str, Any]],
-    primary_col: str,
-    png_path: Path,
-) -> bool:
-    """E. 핵심 응답 × axis 교차 — 연령대·성별·거주권역 3 panel."""
-    if primary_col not in response_schema or primary_col not in df_result.columns:
-        return False
-    if "persona_uuid" not in df_result.columns or "persona_uuid" not in df_personas.columns:
-        return False
-
-    import matplotlib.pyplot as plt  # type: ignore
-
-    meta = response_schema[primary_col]
-    type_class = meta["type_class"]
-
-    keep_cols = ["persona_uuid"]
-    for c in ("age_bucket", "sex", "province"):
-        if c in df_personas.columns:
-            keep_cols.append(c)
-    df_p = df_personas[keep_cols].copy()
-    if "province" in df_p.columns:
-        df_p["urban_class"] = df_p["province"].map(_classify_urban)
-        df_p = df_p.drop(columns=["province"])
-
-    df = df_result.merge(df_p, on="persona_uuid", how="left")
-
-    axis_specs: List[Tuple[str, str, List[str]]] = []
-    if "age_bucket" in df.columns:
-        axis_specs.append(("age_bucket", "연령대", AGE_BUCKET_ORDER))
-    if "sex" in df.columns:
-        sex_order = ["male", "female"]
-        sex_label_map = {"male": "남자", "female": "여자"}
-        axis_specs.append(("sex", "성별", sex_order))
-    else:
-        sex_label_map = {}
-    if "urban_class" in df.columns:
-        axis_specs.append(("urban_class", "거주 권역", ["수도권", "광역시", "그 외"]))
-
-    if not axis_specs:
-        return False
-
-    n = len(axis_specs)
-    if n <= 2:
-        rows, cols = 1, n
-    elif n <= 4:
-        rows, cols = 2, 2
-    else:
-        rows, cols = 2, 3
-    fig, axes_obj = plt.subplots(rows, cols, figsize=(5 * cols, 4.2 * rows))
-    if rows * cols == 1:
-        axes = [axes_obj]
-    else:
-        axes = list(axes_obj.ravel())
-    for k in range(n, rows * cols):
-        axes[k].axis("off")
-
-    title_prefix = (meta.get("description") or meta["q_key"])[:50]
-
-    for ax, (axis_col, axis_label, axis_order) in zip(axes, axis_specs):
-        sub = df[[axis_col, primary_col]].dropna()
-        if sub.empty:
-            ax.text(0.5, 0.5, "데이터 부족", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(axis_label, fontsize=11)
-            continue
-
-        present = list(sub[axis_col].astype(str).unique())
-        groups = [g for g in axis_order if g in present] or sorted(present)
-        display_labels = [
-            sex_label_map.get(g, g) if axis_col == "sex" else str(g)
-            for g in groups
-        ]
-
-        if type_class == "numeric":
-            means: List[float] = []
-            counts: List[int] = []
-            for g in groups:
-                s = pd.to_numeric(sub[sub[axis_col].astype(str) == g][primary_col], errors="coerce").dropna()
-                means.append(float(s.mean()) if len(s) else 0.0)
-                counts.append(int(len(s)))
-            ax.bar(range(len(groups)), means, color="#5b8def", edgecolor="white")
-            ax.set_xticks(range(len(groups)))
-            ax.set_xticklabels(display_labels, rotation=15, fontsize=9)
-            ax.set_ylabel("평균 점수", fontsize=10)
-            scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
-            ax.set_ylim(scale_lo, scale_hi)
-            likert = meta.get("likert_labels")
-            if likert and len(likert) == (scale_hi - scale_lo + 1):
-                yticks = list(range(scale_lo, scale_hi + 1))
-                yticklabels = [
-                    f"{v}\n{likert[v - scale_lo].replace(chr(10), ' ')}"
-                    if v in (scale_lo, (scale_lo + scale_hi) // 2, scale_hi)
-                    else str(v)
-                    for v in yticks
-                ]
-                ax.set_yticks(yticks)
-                ax.set_yticklabels(yticklabels, fontsize=7)
-            for i, (m_v, c_v) in enumerate(zip(means, counts)):
-                ax.text(i, m_v, f"{m_v:.2f}\n(n={c_v})", ha="center", va="bottom", fontsize=8)
-        else:
-            options = meta.get("options") or sorted([str(v) for v in sub[primary_col].unique()])
-            colors = plt.cm.Set2.colors
-            bottom = [0.0] * len(groups)
-            for opt_idx, opt in enumerate(options):
-                ratios: List[float] = []
-                for g in groups:
-                    g_sub = sub[sub[axis_col].astype(str) == g]
-                    n_g = len(g_sub)
-                    if n_g == 0:
-                        ratios.append(0.0)
-                    else:
-                        ratios.append(float((g_sub[primary_col].astype(str) == str(opt)).sum()) / n_g * 100)
-                ax.bar(
-                    range(len(groups)), ratios, bottom=bottom,
-                    label=str(opt)[:14], color=colors[opt_idx % len(colors)],
-                    edgecolor="white",
-                )
-                bottom = [b + r for b, r in zip(bottom, ratios)]
-            ax.set_xticks(range(len(groups)))
-            ax.set_xticklabels(display_labels, rotation=15, fontsize=9)
-            ax.set_ylabel("비율 (%)", fontsize=10)
-            ax.set_ylim(0, 100)
-            ax.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=1)
-
-        ax.set_title(axis_label, fontsize=11)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    fig.suptitle(f"{title_prefix} — 인구학적 axis 교차", fontsize=12, y=1.0)
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-def render_response_by_model(
-    df_result: pd.DataFrame,
-    response_schema: Dict[str, Dict[str, Any]],
-    primary_col: str,
-    png_path: Path,
-) -> bool:
-    """F. 핵심 응답 × 모델 — numeric은 평균 막대, categorical은 stacked bar."""
-    if primary_col not in response_schema or primary_col not in df_result.columns:
-        return False
-    if "model_id" not in df_result.columns:
-        return False
-
-    import matplotlib.pyplot as plt  # type: ignore
-
-    meta = response_schema[primary_col]
-    type_class = meta["type_class"]
-
-    models = sorted([str(m) for m in df_result["model_id"].dropna().unique()])
-    if not models:
-        return False
-
-    title_prefix = (meta.get("description") or meta["q_key"])[:50]
-    fig, ax = plt.subplots(figsize=(max(7.0, len(models) * 1.5), 4.5))
-    labels = [m.rsplit("/", 1)[-1] for m in models]
-
-    if type_class == "numeric":
-        means: List[float] = []
-        counts: List[int] = []
-        for m in models:
-            s = pd.to_numeric(df_result[df_result["model_id"].astype(str) == m][primary_col], errors="coerce").dropna()
-            means.append(float(s.mean()) if len(s) else 0.0)
-            counts.append(int(len(s)))
-        ax.bar(range(len(models)), means, color="#5b8def", edgecolor="white")
-        ax.set_xticks(range(len(models)))
-        ax.set_xticklabels(labels, rotation=15, fontsize=9)
-        ax.set_ylabel("평균 점수", fontsize=10)
-        scale_lo, scale_hi = meta.get("scale_range") or (1, 5)
-        ax.set_ylim(scale_lo, scale_hi)
-        likert = meta.get("likert_labels")
-        if likert and len(likert) == (scale_hi - scale_lo + 1):
-            yticks = list(range(scale_lo, scale_hi + 1))
-            yticklabels = [
-                f"{v}\n{likert[v - scale_lo].replace(chr(10), ' ')}"
-                if v in (scale_lo, (scale_lo + scale_hi) // 2, scale_hi)
-                else str(v)
-                for v in yticks
-            ]
-            ax.set_yticks(yticks)
-            ax.set_yticklabels(yticklabels, fontsize=8)
-        for i, (m_v, c_v) in enumerate(zip(means, counts)):
-            ax.text(i, m_v, f"{m_v:.2f}\n(n={c_v})", ha="center", va="bottom", fontsize=9)
-    else:
-        options = meta.get("options") or sorted([str(v) for v in df_result[primary_col].dropna().unique()])
-        colors = plt.cm.Set2.colors
-        bottom = [0.0] * len(models)
-        for opt_idx, opt in enumerate(options):
-            ratios: List[float] = []
-            for mod in models:
-                g_sub = df_result[df_result["model_id"].astype(str) == mod]
-                g_sub = g_sub.dropna(subset=[primary_col])
-                n_g = len(g_sub)
-                if n_g == 0:
-                    ratios.append(0.0)
-                else:
-                    ratios.append(float((g_sub[primary_col].astype(str) == str(opt)).sum()) / n_g * 100)
-            ax.bar(
-                range(len(models)), ratios, bottom=bottom,
-                label=str(opt)[:16], color=colors[opt_idx % len(colors)],
-                edgecolor="white",
-            )
-            bottom = [b + r for b, r in zip(bottom, ratios)]
-        ax.set_xticks(range(len(models)))
-        ax.set_xticklabels(labels, rotation=15, fontsize=9)
-        ax.set_ylabel("비율 (%)", fontsize=10)
-        ax.set_ylim(0, 100)
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.9, ncol=1)
-
-    ax.set_title(f"{title_prefix} — 모델별 응답", fontsize=12)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
-def render_overview_charts(
-    df_personas: pd.DataFrame,
-    df_result: pd.DataFrame,
-    spec: Dict[str, Any],
-    run_dir: Path,
-) -> str:
-    """응답 결과 시각화 차트 3종을 PNG로 저장 후 markdown 임베드 블록 반환.
-
-    schema_block 자동 검출로 시나리오 무관 동작. 응답 컬럼·axis 정보 부족이면
-    해당 차트 skip — markdown 블록도 그만큼 줄어듦.
-    """
-    if run_dir is None:
-        return ""
-
-    try:
-        _setup_korean_font()
-    except Exception as e:
-        print(f"[warn] 한글 폰트 설정 실패: {e}", flush=True)
-
-    response_schema = _detect_response_columns(spec, df_result)
-    if not response_schema:
-        print("[warn] 응답 schema 검출 실패 — 인포그래픽 skip", flush=True)
-        return ""
-
-    primary_col = _select_primary_response_col(spec, response_schema)
-
-    blocks: List[str] = []
-
-    dist_path = run_dir / "chart_response_dist.png"
-    try:
-        if render_response_distribution(df_result, response_schema, dist_path):
-            blocks.append("![응답 항목별 분포](chart_response_dist.png)")
-    except Exception as e:
-        print(f"[warn] 응답 분포 차트 실패: {e}", flush=True)
-
-    if primary_col:
-        axis_path = run_dir / "chart_response_by_axis.png"
-        try:
-            if render_response_by_axis(df_personas, df_result, response_schema, primary_col, axis_path):
-                blocks.append("![핵심 응답 × 인구학적 axis](chart_response_by_axis.png)")
-        except Exception as e:
-            print(f"[warn] axis 교차 차트 실패: {e}", flush=True)
-
-        model_path = run_dir / "chart_response_by_model.png"
-        try:
-            if render_response_by_model(df_result, response_schema, primary_col, model_path):
-                blocks.append("![핵심 응답 × 모델](chart_response_by_model.png)")
-        except Exception as e:
-            print(f"[warn] 모델 비교 차트 실패: {e}", flush=True)
-
-    if not blocks:
-        return ""
-
-    return "\n\n".join(["**한눈에 보기 — 응답 결과 시각화**", "", *blocks, ""])
 
 
 def compose_overview(
@@ -1181,7 +450,36 @@ def compose_overview(
     if topic_short:
         lines.append(f"| 시나리오 | {topic_short} |")
     lines.append("| 페르소나 출처 | NVIDIA Nemotron-Personas-Korea (한국 인구통계 합성 페르소나) |")
-    lines.append(f"| 추출 방식 | 시드 고정 무작위 추출 (seed={seed}) |")
+
+    # 추출 방식 — filters / stratify_by 적용 시 한 줄로 명시
+    filters_dict = spec.get("filters", {}) or {}
+    filter_parts: List[str] = []
+    if filters_dict.get("province"):
+        filter_parts.append(f"지역={filters_dict['province']}")
+    if filters_dict.get("sex"):
+        filter_parts.append(f"성별={filters_dict['sex']}")
+    if filters_dict.get("age_min"):
+        filter_parts.append(f"나이≥{filters_dict['age_min']}")
+    age_max_val = filters_dict.get("age_max")
+    if age_max_val and age_max_val < 120:
+        filter_parts.append(f"나이≤{age_max_val}")
+    if filters_dict.get("education_level"):
+        filter_parts.append(f"학력={filters_dict['education_level']}")
+    if filters_dict.get("occupation"):
+        filter_parts.append(f"직업={filters_dict['occupation']}")
+    stratify_by = filters_dict.get("stratify_by")
+    stratify_label_map = {"province": "지역", "age_bucket": "연령대", "sex": "성별"}
+
+    if stratify_by:
+        s_label = stratify_label_map.get(stratify_by, stratify_by)
+        lines.append(
+            f"| 추출 방식 | {s_label} 균등 분배 + 시드 고정 무작위 (seed={seed}) |"
+        )
+    else:
+        lines.append(f"| 추출 방식 | 시드 고정 무작위 추출 (seed={seed}) |")
+
+    if filter_parts:
+        lines.append(f"| 인구 필터 | {' · '.join(filter_parts)} |")
     lines.append(f"| 페르소나 수 | {n}명 |")
     lines.append(f"| 시뮬레이션 모델 수 | {len(models)}개 |")
     lines.append(f"| 응답 수 (페르소나 × 모델) | {n_total}건 |")
@@ -1209,14 +507,8 @@ def compose_overview(
         lines.append(f"- {model_label(m)}")
     lines.append("")
 
-    # 인포그래픽 — 측정 개요 표 + 모델 목록 직후, 본격 본문 진입 전
-    if run_dir is not None:
-        try:
-            charts_md = render_overview_charts(df_personas, df_result, spec, run_dir)
-            if charts_md:
-                lines.append(charts_md)
-        except Exception as e:
-            print(f"[warn] 인포그래픽 임베드 실패: {e}", flush=True)
+    # 인포그래픽은 Observable Framework 빌드 산출물(observable/index.html)에서 노출.
+    # report.md 본문에는 차트를 PNG로 박지 않는다(SSOT는 Observable).
 
     return "\n".join(lines)
 
@@ -2308,6 +1600,170 @@ def build_sources_zip(run_dir: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────
+# Observable Framework 빌드 — 측정 결과 → 정적 사이트
+# ─────────────────────────────────────────────────────────
+
+def run_observable_build(run_dir: Path) -> Optional[Path]:
+    """frontend-obs 를 KK_RUN_DIR=run_dir 환경에서 빌드해 산출물을 run_dir/observable/ 로 복사.
+
+    흐름:
+      1. KK_RUN_DIR=str(run_dir) 환경변수로 ``npx --yes observable build`` 호출
+      2. frontend-obs/dist 가 생성되면 run_dir/observable/ 로 복사 (기존 디렉토리는 교체)
+      3. 결과 디렉토리 경로를 반환. 실패 시 None.
+
+    Node 또는 npx 가 시스템에 없으면 즉시 None 반환. Observable Framework 빌드는 데이터 로더
+    (src/data/scenario.json.py)가 ``KK_RUN_DIR`` 을 읽어 spec.json + result.csv + personas.csv +
+    insight.json 을 합쳐 site 정적 JSON으로 만든다.
+    """
+    import shutil
+    import subprocess
+
+    fobs_root = Path(__file__).resolve().parents[1] / "frontend-obs"
+    if not fobs_root.exists():
+        print(f"[warn] frontend-obs 미존재: {fobs_root}", file=sys.stderr, flush=True)
+        return None
+
+    npx = shutil.which("npx")
+    if not npx:
+        print("[warn] npx 미설치 — Observable build 건너뜀", file=sys.stderr, flush=True)
+        return None
+
+    env = os.environ.copy()
+    env["KK_RUN_DIR"] = str(run_dir)
+
+    try:
+        result = subprocess.run(
+            [npx, "--yes", "observable", "build"],
+            cwd=str(fobs_root),
+            env=env,
+            check=True,
+            timeout=600,
+            capture_output=True,
+            text=True,
+        )
+        # stdout 마지막 몇 줄만 로그로 (빌드 진행 노이즈 절감)
+        tail = "\n".join((result.stdout or "").splitlines()[-5:])
+        if tail.strip():
+            print(f"[observable build] {tail}", flush=True)
+    except subprocess.CalledProcessError as e:
+        err_tail = "\n".join((e.stderr or e.stdout or "").splitlines()[-10:])
+        print(
+            f"[warn] Observable build 실패 (rc={e.returncode}): {err_tail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    except subprocess.TimeoutExpired:
+        print("[warn] Observable build 타임아웃 (600s 초과)", file=sys.stderr, flush=True)
+        return None
+    except Exception as e:
+        print(f"[warn] Observable build 예외: {e!r}", file=sys.stderr, flush=True)
+        return None
+
+    dist_dir = fobs_root / "dist"
+    if not dist_dir.exists():
+        print(f"[warn] Observable dist 산출물 미존재: {dist_dir}", file=sys.stderr, flush=True)
+        return None
+
+    dest_dir = run_dir / "observable"
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(dist_dir, dest_dir)
+    return dest_dir
+
+
+def render_observable_pdf(run_dir: Path) -> Optional[Path]:
+    """run_dir/observable/index.html → run_dir/report_obs.pdf (playwright Chromium 사용).
+
+    A4 세로, 한국어 시스템 폰트 fallback (Noto Sans CJK / Nanum) 자동 적용. playwright 가
+    설치되지 않았거나 Chromium 바이너리가 없으면 None 반환. Observable Framework 산출물은
+    절대경로 의존성(`/_observablehq/...`, `/_file/...`)을 갖기 때문에 file:// 로 직접 열면
+    리소스 로딩이 실패한다. 이를 우회하기 위해 같은 디렉토리에서 임시 HTTP 서버를 띄워 그 URL
+    을 navigate 한다.
+    """
+    import http.server
+    import socketserver
+    import threading
+
+    obs_dir = run_dir / "observable"
+    obs_index = obs_dir / "index.html"
+    if not obs_index.exists():
+        print(f"[warn] observable/index.html 미존재 — PDF 생략: {obs_index}", file=sys.stderr, flush=True)
+        return None
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        print(
+            "[warn] playwright 미설치 — Observable PDF 생략. "
+            "(pip install playwright + python -m playwright install chromium)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    pdf_path = run_dir / "report_obs.pdf"
+
+    # 임시 HTTP 서버 — 절대경로(`/_observablehq/...`, `/_file/...`) 리소스 해결.
+    class _Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(obs_dir), **kw)
+
+        def log_message(self, *args, **kwargs):  # noqa: ARG002
+            return  # noisy access log 억제
+
+    httpd: Optional[socketserver.TCPServer] = None
+    server_thread: Optional[threading.Thread] = None
+
+    try:
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+        port = httpd.server_address[1]
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+
+        url = f"http://127.0.0.1:{port}/index.html"
+
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as e:
+                print(
+                    f"[warn] playwright Chromium launch 실패: {e!r} — "
+                    "(python -m playwright install chromium 으로 바이너리 설치 필요)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=60_000)
+                # Observable 차트(Plot.js)는 D3 layout 후에 그려지므로 짧은 추가 대기.
+                page.wait_for_timeout(800)
+                page.pdf(
+                    path=str(pdf_path),
+                    format="A4",
+                    print_background=True,
+                    margin={"top": "12mm", "bottom": "12mm", "left": "12mm", "right": "12mm"},
+                )
+            finally:
+                browser.close()
+    except Exception as e:
+        print(f"[warn] Observable PDF 렌더 실패: {e!r}", file=sys.stderr, flush=True)
+        return None
+    finally:
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except Exception:
+                pass
+
+    if not pdf_path.exists():
+        return None
+    return pdf_path
+
+
+# ─────────────────────────────────────────────────────────
 # 메인 흐름
 # ─────────────────────────────────────────────────────────
 
@@ -2763,7 +2219,39 @@ def main(run_dir: Path) -> int:
 
         (run_dir / "report.md").write_text(report_md, encoding="utf-8")
 
-        # PDF + PNG + sources.zip
+        # Observable Framework 빌드 — 측정 결과를 정적 사이트로
+        status["phase"] = "observable_build"
+        write_status(run_dir, status)
+        observable_ok = False
+        try:
+            obs_dir = run_observable_build(run_dir)
+            if obs_dir is not None:
+                status["observable_ready"] = True
+                status["observable_dir"] = obs_dir.name  # run_dir 기준 상대 (= "observable")
+                observable_ok = True
+            else:
+                status["observable_ready"] = False
+        except Exception as e:
+            print(f"[warn] Observable 빌드 예외: {e!r}", file=sys.stderr, flush=True)
+            status["observable_ready"] = False
+            status["error"] = (status.get("error") or "") + f" / observable_build_failed: {e!r}"
+
+        # Observable HTML → PDF (playwright Chromium) — 빌드가 성공한 경우에만 시도
+        if observable_ok:
+            status["phase"] = "observable_pdf"
+            write_status(run_dir, status)
+            try:
+                pdf_path = render_observable_pdf(run_dir)
+                if pdf_path is not None:
+                    status["observable_pdf_ready"] = True
+                else:
+                    status["observable_pdf_ready"] = False
+            except Exception as e:
+                print(f"[warn] Observable PDF 예외: {e!r}", file=sys.stderr, flush=True)
+                status["observable_pdf_ready"] = False
+                status["error"] = (status.get("error") or "") + f" / observable_pdf_failed: {e!r}"
+
+        # 옛 PDF/PNG 경로 (matplotlib 차트 제거 후에도 report.md → PDF/PNG는 호환성 유지)
         try:
             render_report_files(run_dir, report_md, spec.get("topic", "") or "보고서")
         except Exception as e:

@@ -30,6 +30,11 @@ _internal/
 # 결과 — backend/results는 백업용으로 로컬에만, frontend/data로 복사된 것만 깃허브
 backend/results/
 
+# Observable Framework 빌드 산출물 — 측정 결과 디렉토리 안의 observable/ + report_obs.pdf는
+# frontend-obs/ 소스에서 재빌드 가능한 derived 산출물. 큰 binary라 깃허브 미동기화.
+frontend/data/*/observable/
+frontend/data/*/report_obs.pdf
+
 # 게이트웨이 산출물 — gateway.py 실행 시 PROJECT_ROOT/results/gateway_runs/에
 # 페르소나 원문·응답·소스 zip 저장. 외부 노출 금지.
 results/

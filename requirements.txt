@@ -20,12 +20,15 @@ python-dotenv>=1.0.0
 requests>=2.32.0
 httpx>=0.25.0
 
-# 보고서 렌더링 (markdown → HTML → PDF/PNG)
+# 보고서 렌더링 (markdown → HTML → PDF/PNG, 옛 weasyprint 경로 호환성)
 markdown>=3.5.0
-matplotlib>=3.7.0
 weasyprint>=60.0
 pypdfium2>=4.20.0
 Pillow>=10.0.0
+
+# 본 라운드 시각화 — Observable Framework 빌드 산출물 → PDF (Chromium headless)
+# 별도 단계: python -m playwright install chromium
+playwright>=1.40.0
 
 # (선택) Streamlit 게이트웨이 — gateway.py 실행 시에만 필요 (인증 + 쿠키 컨트롤러)
 streamlit>=1.30.0
