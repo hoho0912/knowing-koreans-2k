@@ -1,24 +1,78 @@
 /* knowing-koreans — Observable Framework 스타일 보완 */
 
 :root {
+  --kk-fg: #1f2328;
+  --kk-bg: #ffffff;
   --kk-accent: #1f6feb;
   --kk-accent-soft: #e6efff;
   --kk-bg-soft: #f6f8fa;
   --kk-border: #d0d7de;
   --kk-quote-bg: #fff8e6;
   --kk-quote-border: #f0c674;
+  --kk-quote-fg: #1f2328;
   --kk-card-bg: #ffffff;
   --kk-muted: #57606a;
+  --kk-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+
+  /* Framework default h1~h6 색상은 --theme-foreground-alt(본문 90% mix)로 옅게 깔림.
+     변수 override로 framework rule도 우리 본문 색과 통일 (특히 다크 모드 H2 가독성). */
+  --theme-foreground-alt: var(--kk-fg);
+}
+
+body, .observablehq {
+  color: var(--kk-fg);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--kk-fg);
+}
+
+/* Observable Plot 차트 — figure/svg 본문 색을 --kk-fg에 묶어 axis label·tick·legend·figcaption이
+   prefers-color-scheme에 따라 자동 전환되도록. light: #1f2328, dark: #e6edf3 */
+figure,
+figcaption {
+  color: var(--kk-fg);
+}
+figure svg text {
+  fill: currentColor;
+}
+figure svg [aria-label$="-axis tick"] line,
+figure svg [aria-label$="-axis"] line {
+  stroke: var(--kk-muted);
+}
+
+html, body, h1, h2, h3, h4, h5, h6,
+p, li, dt, dd, table, th, td, blockquote,
+button, input, select, textarea,
+.observablehq, .observablehq-link,
+.lede, .muted, .metric-card, .finding-card, .hypothesis-card,
+.quote-card, .response-card, .next-question, .analysis-table-card,
+details.scenario-spec, details.scenario-spec > summary {
+  font-family: var(--kk-font-sans);
+}
+
+/* H1~H6 anchor link override — Observable Framework default가 청색 밑줄로 노출되는 것 차단 */
+.observablehq-header-anchor {
+  color: inherit;
+  text-decoration: none;
+}
+.observablehq-header-anchor:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--kk-muted);
+  text-underline-offset: 4px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
+    --kk-fg: #e6edf3;
+    --kk-bg: #0d1117;
     --kk-accent: #58a6ff;
     --kk-accent-soft: #1e2a44;
     --kk-bg-soft: #1c2128;
     --kk-border: #30363d;
     --kk-quote-bg: #2a2310;
     --kk-quote-border: #d4a72c;
+    --kk-quote-fg: #f0e6c2;
     --kk-card-bg: #161b22;
     --kk-muted: #8b949e;
   }
@@ -27,7 +81,7 @@
 .lede {
   font-size: 1.05rem;
   line-height: 1.6;
-  color: var(--theme-foreground-muted);
+  color: var(--kk-fg);
   margin: 0.5em 0 1.5em 0;
   padding: 1em 1.2em;
   background: var(--kk-bg-soft);
@@ -82,12 +136,37 @@
 .finding-card,
 .hypothesis-card,
 .quote-card,
-.response-card {
+.response-card,
+.analysis-table-card {
   background: var(--kk-card-bg);
   border: 1px solid var(--kk-border);
   border-radius: 6px;
   padding: 1rem 1.2rem;
   margin: 0.75rem 0;
+}
+
+.analysis-table-card table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5em;
+  font-size: 0.9rem;
+}
+
+.analysis-table-card th,
+.analysis-table-card td {
+  padding: 0.5em 0.7em;
+  border-bottom: 1px solid var(--kk-border);
+  vertical-align: top;
+}
+
+.analysis-table-card thead th {
+  background: var(--kk-bg-soft);
+  font-weight: 600;
+  border-bottom: 2px solid var(--kk-border);
+}
+
+.analysis-table-card tbody tr:last-child td {
+  border-bottom: none;
 }
 
 .finding-card .finding-label {
@@ -115,6 +194,7 @@
   border-left: 4px solid var(--kk-quote-border);
   border-radius: 4px;
   font-style: italic;
+  color: var(--kk-quote-fg);
 }
 
 .quote-card .curator-note {

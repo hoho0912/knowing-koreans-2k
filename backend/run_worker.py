@@ -514,168 +514,21 @@ def compose_overview(
 
 
 # ─────────────────────────────────────────────────────────
-# 응답자 속성 축별 분포 — 질문별 6개 축
+# (구) 응답자 속성 축별 분포 hardcoded 헬퍼 — 폐기
+#
+# 이전에는 _detect_numeric_range / _parse_int_in_range / compose_axis_breakdown으로
+# 질문 type(integer/likert_5/likert_7/single_choice/free_text)별 분기 표를 코드로
+# 생성했으나, 문항 type이 늘 때마다 분기를 추가해야 하는 땜질 구조였음.
+# 인사이트 LLM이 schema와 raw 응답을 직접 보고 analysis_tables를 자율 결정하는
+# 방식으로 대체. 본 영역에는 더 이상 코드 표 생성 함수를 두지 않는다.
 # ─────────────────────────────────────────────────────────
-AXIS_DEFS: List[Tuple[str, str, Optional[str]]] = [
-    ("__all__",           "전체 분포",          None),
-    ("region",            "수도권 vs 비수도권", "region"),
-    ("age_bucket",        "연령대별",           "age_bucket"),
-    ("education_level",   "학력별",             "education_level"),
-    ("sex",               "성별",               "sex"),
-    ("marital_status",    "혼인 상태별",         "marital_status"),
-]
-
-
-def compose_axis_breakdown(
-    spec: Dict[str, Any],
-    df_personas: pd.DataFrame,
-    df_result: pd.DataFrame,
-) -> str:
-    """질문별 × 응답자 속성 축별 분포 표."""
-    lines: List[str] = []
-
-    schema_block = spec.get("schema_block", "") or "{}"
-    try:
-        schema = json.loads(schema_block)
-    except json.JSONDecodeError:
-        return ""
-    if not isinstance(schema, dict):
-        return ""
-
-    if "ok" in df_result.columns:
-        df_ok = df_result[df_result["ok"] == True].copy()  # noqa: E712
-    else:
-        df_ok = df_result.copy()
-
-    lines.append("## 응답 — 응답자 속성 축별 분포")
-    lines.append("")
-    lines.append(
-        "각 질문에 대해 응답자 속성 축(전체·수도권/비수도권·연령대·학력·성별·"
-        "혼인 상태)별로 응답이 어떻게 갈리는지 정리한 표입니다. 표본이 작은 "
-        "그룹은 신호로 보기 어려우니 함께 표시되는 응답수를 같이 봐 주세요."
-    )
-    lines.append("")
-
-    if len(df_ok) == 0 or df_personas is None or len(df_personas) == 0:
-        lines.append("_(성공 응답이 없어 축별 분포를 생략합니다.)_")
-        lines.append("")
-        return "\n".join(lines)
-
-    # 페르소나 응답자 속성 컬럼을 result에 병합
-    persona_axis_cols = [
-        "persona_uuid", "province", "age_bucket", "sex",
-        "education_level", "marital_status",
-    ]
-    avail_cols = [c for c in persona_axis_cols if c in df_personas.columns]
-    df_joined = df_ok.merge(df_personas[avail_cols], on="persona_uuid", how="left")
-    if "province" in df_joined.columns:
-        df_joined["region"] = df_joined["province"].apply(province_to_region)
-
-    q_text_map = parse_questions_text(spec.get("questions", "") or "")
-
-    for q_idx, (q_key, q_def) in enumerate(schema.items(), start=1):
-        if not isinstance(q_def, dict):
-            continue
-        q_type = q_def.get("type", "string")
-        q_scale = q_def.get("scale", "")
-        q_enum = q_def.get("enum") or q_def.get("options") or []
-
-        # 자유서술(string + description, no enum/options)은 축별 분포 대상이 아님
-        if q_type == "string" and not q_enum:
-            continue
-
-        col = f"resp_{q_key}"
-        if col not in df_joined.columns:
-            continue
-
-        # q_key의 선두 번호로 질문 텍스트 매칭
-        m = re.match(r"q(\d+)", q_key)
-        q_num = int(m.group(1)) if m else q_idx
-        q_text = q_text_map.get(q_num, q_key)
-
-        lines.append(f"## {q_num}. {q_text}")
-        lines.append("")
-        if q_scale:
-            lines.append(f"_{q_scale}_")
-            lines.append("")
-        elif q_enum:
-            lines.append(f"_옵션: {', '.join(q_enum)}_")
-            lines.append("")
-
-        for axis_key, axis_label, axis_col in AXIS_DEFS:
-            if axis_col is not None and axis_col not in df_joined.columns:
-                continue
-
-            lines.append(f"### {axis_label}")
-            lines.append("")
-
-            if axis_col is None:
-                groups: List[Tuple[str, pd.DataFrame]] = [("전체", df_joined)]
-            else:
-                unique_vals = sorted(
-                    df_joined[axis_col].dropna().astype(str).unique().tolist()
-                )
-                groups = [
-                    (g, df_joined[df_joined[axis_col].astype(str) == g])
-                    for g in unique_vals
-                ]
-
-            if q_type == "integer":
-                # 리커트 응답코드는 "점수"가 아니므로 "1점/2점" 표기를 피함.
-                # 의미는 위쪽 캡션(예: "1~5 Likert (1=매우 반대, 5=매우 찬성)")
-                # 한 군데에서만 전달. 표 헤더는 응답코드 숫자만 노출.
-                lines.append(
-                    "| 응답자 속성 | 응답수 | 평균 | 표준편차 | "
-                    "1 | 2 | 3 | 4 | 5 |"
-                )
-                lines.append(
-                    "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
-                )
-                for g_val, g_df in groups:
-                    series = pd.to_numeric(g_df[col], errors="coerce").dropna()
-                    if len(series) == 0:
-                        continue
-                    counts = series.astype(int).value_counts().to_dict()
-                    cells = [counts.get(i, 0) for i in range(1, 6)]
-                    std_str = (
-                        f"{series.std():.2f}"
-                        if len(series) >= 2 and not pd.isna(series.std())
-                        else "-"
-                    )
-                    lines.append(
-                        f"| {g_val} | {len(series)} | {series.mean():.2f} | "
-                        f"{std_str} | "
-                        + " | ".join(str(c) for c in cells) + " |"
-                    )
-                lines.append("")
-
-            elif q_type == "string" and q_enum:
-                opt_labels = [str(o).replace("_", " ") for o in q_enum]
-                lines.append(
-                    "| 응답자 속성 | 응답수 | "
-                    + " | ".join(opt_labels) + " |"
-                )
-                lines.append(
-                    "|---|---:|"
-                    + "|".join(["---:"] * len(q_enum)) + "|"
-                )
-                for g_val, g_df in groups:
-                    series = g_df[col].dropna().astype(str)
-                    if len(series) == 0:
-                        continue
-                    counts = series.value_counts().to_dict()
-                    cells = [counts.get(opt, 0) for opt in q_enum]
-                    lines.append(
-                        f"| {g_val} | {len(series)} | "
-                        + " | ".join(str(c) for c in cells) + " |"
-                    )
-                lines.append("")
-
-    return "\n".join(lines)
 
 
 def split_insights(insights_md: str) -> Tuple[str, str]:
-    """LLM이 만든 4섹션을 (핵심발견+가설) / (곱씹을응답+다음질문) 둘로 분리.
+    """LLM 산출 markdown을 보고서의 위·아래 두 영역으로 분리.
+
+    위쪽: ## 응답 분석 + ## 핵심 발견 + ## 큐레이터 관점·가설
+    아래쪽: ## 곱씹을 만한 응답 + ## 다음에 던져볼 질문·가설
 
     분리 마커: '## 곱씹을 만한 응답'.
     LLM이 이 헤더를 안 만들었으면 전체를 위쪽에 두고 아래쪽은 빈 문자열.
@@ -1449,6 +1302,25 @@ def insight_json_to_markdown(insight: Optional[Dict[str, Any]]) -> str:
         )
     out: List[str] = []
 
+    # 응답 분석 — LLM이 schema·raw 응답을 보고 자율 결정한 표 모음
+    tables = insight.get("analysis_tables") or []
+    if tables:
+        out.append("## 응답 분석")
+        out.append("")
+        for t in tables:
+            if isinstance(t, dict):
+                title = (t.get("title") or "").strip()
+                md = (t.get("markdown") or "").strip()
+                if title:
+                    out.append(f"### {title}")
+                    out.append("")
+                if md:
+                    out.append(md)
+                    out.append("")
+            elif isinstance(t, str) and t.strip():
+                out.append(t.strip())
+                out.append("")
+
     # 핵심 발견
     out.append("## 핵심 발견")
     out.append("")
@@ -1631,6 +1503,27 @@ def run_observable_build(run_dir: Path) -> Optional[Path]:
     env = os.environ.copy()
     env["KK_RUN_DIR"] = str(run_dir)
 
+    # data loader (src/data/scenario.json.py) 는 `python3 file.py` 로 실행되며 PATH 우선
+    # 매칭이다. ssh 비대화형 세션은 systemd Environment 를 상속받지 않아 PATH 가 시스템
+    # default 만 잡혀 venv site-packages (pandas 등) 가 안 보인다. systemd 자동화는
+    # EnvironmentFile/PATH 가 venv/bin 우선이라 정상 동작하지만, 수동 ssh 검증 환경에서
+    # 같은 빌드를 돌리면 ModuleNotFoundError. 본 라인이 두 환경 모두 보장한다.
+    venv_bin = str(Path(sys.prefix) / "bin")
+    if venv_bin not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+
+    # 빌드 직전 캐시·옛 dist 청소.
+    # Observable Framework data loader 결과는 src/.observablehq/cache/ 에 캐시되며 invalidation은
+    # loader 소스 파일의 mtime/내용 기준으로만 판정한다. KK_RUN_DIR 환경변수 변경 / style.css 등
+    # 본문 변경은 캐시 무효화 신호로 인식되지 않으므로, 측정마다 다른 KK_RUN_DIR 을 안전하게
+    # 반영하려면 빌드 직전에 캐시·이전 dist를 명시적으로 제거한다.
+    cache_dir = fobs_root / "src" / ".observablehq" / "cache"
+    dist_dir = fobs_root / "dist"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir, ignore_errors=True)
+
     try:
         result = subprocess.run(
             [npx, "--yes", "observable", "build"],
@@ -1660,7 +1553,6 @@ def run_observable_build(run_dir: Path) -> Optional[Path]:
         print(f"[warn] Observable build 예외: {e!r}", file=sys.stderr, flush=True)
         return None
 
-    dist_dir = fobs_root / "dist"
     if not dist_dir.exists():
         print(f"[warn] Observable dist 산출물 미존재: {dist_dir}", file=sys.stderr, flush=True)
         return None
@@ -2191,16 +2083,14 @@ def main(run_dir: Path) -> int:
                 print(f"[warn] insight.json 저장 실패: {e}", file=sys.stderr, flush=True)
             insights_md = insight_json_to_markdown(insight_json)
 
-        # (d) 인사이트를 둘로 분리 — 핵심발견·가설 / 곱씹을응답·다음질문
+        # (d) 인사이트를 둘로 분리 — (분석 표 + 핵심발견 + 가설) / (곱씹을응답 + 다음질문)
+        # 분석 표(analysis_tables)는 인사이트 LLM이 자율 결정해 top_insights에 포함됨.
         top_insights, bottom_insights = split_insights(insights_md)
 
-        # (e) 응답자 속성 축별 분포 — 코드 생성
-        axis_md = compose_axis_breakdown(spec, df_personas, df_result)
-
-        # (f) 부록 — 코드 생성 (원본 질문/스키마/명세 포함)
+        # (e) 부록 — 코드 생성 (원본 질문/스키마/명세 포함)
         appendix_md = compose_appendix(spec, df_personas, df_result)
 
-        # (g) 합치기: 헤더 + 주의문 + 측정개요 + 핵심발견·가설 + 축별분포 + 곱씹을응답·다음질문 + 부록
+        # (f) 합치기: 헤더 + 주의문 + 측정개요 + (분석표·핵심발견·가설) + 곱씹을응답·다음질문 + 부록
         disclaimer = (
             "> ⚠️ **해석 주의**: 본 보고서는 합성 페르소나·LLM 시뮬레이션 결과입니다. "
             "실제 여론이 아니며, \"이 모델·이 표본에서는 ~한 신호가 보인다\" 정도로만 "
@@ -2211,7 +2101,6 @@ def main(run_dir: Path) -> int:
             disclaimer,
             overview_md,
             top_insights,
-            axis_md,
             bottom_insights,
             appendix_md,
         ]

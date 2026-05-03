@@ -33,9 +33,9 @@ export default {
   ],
   theme: ["air", "near-midnight"],
   header: "",
-  footer:
-    "knowing-koreans · 데이터: NVIDIA Nemotron-Personas-Korea (CC BY 4.0) · OpenRouter 경유 다중 LLM",
-  toc: true,
+  footer: "",
+  sidebar: false,
+  toc: false,
   pager: false,
   search: false,
   style: "style.css"

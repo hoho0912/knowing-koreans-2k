@@ -84,7 +84,13 @@ def _classify_urban(province: Any) -> str:
 # ─────────────────────────────────────────────────────────
 
 def _detect_schema(schema_block_raw: Any, df: pd.DataFrame) -> dict:
-    """spec.schema_block + result.csv 컬럼 교차해서 응답 컬럼 메타 추출."""
+    """spec.schema_block + result.csv 컬럼 교차해서 응답 컬럼 메타 추출.
+
+    type 분류:
+      numeric     ← integer / likert / likert_5 / likert_7 / scale 텍스트에 'Likert'
+      categorical ← single_choice / multi_choice / options(enum) 보유
+      freetext    ← free_text / freetext / text / string + 자유서술 표지
+    """
     try:
         schema = (
             json.loads(schema_block_raw)
@@ -101,22 +107,45 @@ def _detect_schema(schema_block_raw: Any, df: pd.DataFrame) -> dict:
         col = f"resp_{q_key}"
         if col not in df.columns or not isinstance(q_def, dict):
             continue
-        t = q_def.get("type", "")
+        t_raw = q_def.get("type", "")
+        t = (t_raw or "").lower().strip()
         options = q_def.get("options") or q_def.get("enum")
         scale = q_def.get("scale", "")
         min_length = q_def.get("min_length")
         desc = q_def.get("description", "") or ""
 
         scale_range = None
-        if t == "integer" or "Likert" in str(scale) or "likert" in str(scale).lower():
+        is_numeric = (
+            t in ("integer", "likert", "likert_5", "likert_7")
+            or "likert" in str(scale).lower()
+        )
+
+        if is_numeric:
             type_class = "numeric"
-            scale_range = [1, 5]
-            m = re.search(r"(\d+)\s*[-~]\s*(\d+)", str(scale))
-            if m:
-                scale_range = [int(m.group(1)), int(m.group(2))]
-        elif options and isinstance(options, list) and len(options) > 0:
+            if t == "likert_7":
+                scale_range = [1, 7]
+            elif t in ("likert_5", "likert"):
+                scale_range = [1, 5]
+            else:
+                # integer 또는 scale 텍스트 기반 추정
+                scale_range = [1, 5]
+                m = re.search(r"(\d+)\s*[-~∼]\s*(\d+)", str(scale))
+                if m:
+                    scale_range = [int(m.group(1)), int(m.group(2))]
+                else:
+                    keys = sorted(
+                        {int(k) for k in re.findall(r"(\d+)\s*=", str(scale))}
+                    )
+                    if len(keys) >= 2:
+                        scale_range = [keys[0], keys[-1]]
+        elif t in ("single_choice", "multi_choice") or (
+            options and isinstance(options, list) and len(options) > 0
+        ):
             type_class = "categorical"
-        elif t == "string" and (min_length or "자유" in desc or "서술" in desc):
+        elif (
+            t in ("free_text", "freetext", "text")
+            or (t == "string" and (min_length or "자유" in desc or "서술" in desc))
+        ):
             type_class = "freetext"
         else:
             type_class = "categorical" if options else "freetext"
@@ -142,8 +171,8 @@ def _detect_schema(schema_block_raw: Any, df: pd.DataFrame) -> dict:
 # 정규화 헬퍼
 # ─────────────────────────────────────────────────────────
 
-def to_int_likert(v: Any) -> Optional[int]:
-    """Likert 응답을 1~5 정수로 강제. schema echo·NaN·범위 외 → None."""
+def to_int_in_range(v: Any, lo: int = 1, hi: int = 5) -> Optional[int]:
+    """응답값을 [lo, hi] 정수로 강제. schema echo·NaN·범위 외 → None."""
     if v is None:
         return None
     if isinstance(v, float) and pd.isna(v):
@@ -151,10 +180,18 @@ def to_int_likert(v: Any) -> Optional[int]:
     s = str(v).strip()
     if not s or s.lower() in {"nan", "none"}:
         return None
-    m = re.match(r"^([1-5])\b", s)
+    m = re.match(r"^(\d+)\b", s)
     if not m:
         return None
-    return int(m.group(1))
+    n = int(m.group(1))
+    if n < lo or n > hi:
+        return None
+    return n
+
+
+def to_int_likert(v: Any) -> Optional[int]:
+    """후방호환 wrapper — 1~5 강제."""
+    return to_int_in_range(v, 1, 5)
 
 
 def normalize_categorical(v: Any, options: list) -> Optional[str]:
@@ -249,10 +286,14 @@ def main() -> None:
     # schema 자동 검출
     detected = _detect_schema(spec.get("schema_block", ""), df_ok)
 
-    # 응답 정규화
+    # 응답 정규화 — numeric은 컬럼별 scale_range로 파싱
     for col, meta in detected.items():
         if meta["type_class"] == "numeric":
-            df_ok[col + "_int"] = df_ok[col].apply(to_int_likert)
+            r = meta.get("scale_range") or [1, 5]
+            lo, hi = int(r[0]), int(r[1])
+            df_ok[col + "_int"] = df_ok[col].apply(
+                lambda v, lo=lo, hi=hi: to_int_in_range(v, lo, hi)
+            )
         elif meta["type_class"] == "categorical" and meta["options"]:
             opts = meta["options"]
             df_ok[col + "_norm"] = df_ok[col].apply(
@@ -378,7 +419,10 @@ def main() -> None:
     sample_rows = []
     if primary_col:
         primary_int = primary_col + "_int"
-        for v in range(1, 6):
+        primary_meta_row = next(q for q in questions if q["col"] == primary_col)
+        primary_range = primary_meta_row.get("scale_range") or [1, 5]
+        p_lo, p_hi = int(primary_range[0]), int(primary_range[1])
+        for v in range(p_lo, p_hi + 1):
             sub = df_valid[df_valid[primary_int] == v]
             take = min(6, len(sub))
             if take == 0:
@@ -440,6 +484,7 @@ def main() -> None:
         "crosstabs": crosstabs,
         "sample_responses": sample_rows,
         "insight": {
+            "analysis_tables": insight.get("analysis_tables", []),
             "key_findings": insight.get("key_findings", []),
             "curator_hypotheses": insight.get("curator_hypotheses", []),
             "responses_to_chew_on": insight.get("responses_to_chew_on", []),
