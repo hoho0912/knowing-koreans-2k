@@ -1,6 +1,6 @@
 # knowing-koreans · 한국인 페르소나 시뮬레이터
 
-> **합성 페르소나로 큐레이터 가설을 점검하는 도구.**
+> **합성 페르소나로 가설을 점검하는 도구.**
 
 NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·정책 시나리오를 던져, 여러 LLM이 어떻게 응답하는지 비교·시각화합니다.
 
@@ -10,7 +10,6 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 
 ## 버전 / 변경 이력
 
-> 사이트·측정·문서의 누적 변경. 규모는 SemVer 풍 — MAJOR(라운드·시나리오 교체), MINOR(차트·섹션·모델 변경), PATCH(버그·문구).
 
 ### v0.3.0 · 2026-05-03 — Observable Framework 도입 + 차트 정렬
 
