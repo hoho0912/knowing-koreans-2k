@@ -74,6 +74,20 @@ def validate_spec(spec: Dict[str, Any]) -> List[str]:
                 f"(질문 번호 {qs_sorted}, 키 {list(schema.keys())})"
             )
 
+    # 외부 리뷰 #5 — 각 schema value가 dict인지 강제. string-value JSON이 통과하면
+    # frontend-obs/src/data/scenario.json.py:108이 모든 응답 컬럼을 skip해 차트가
+    # 비는 사고가 발생한다. type/scale/options/description 등 dict 필드가 필요.
+    if schema is not None and isinstance(schema, dict):
+        non_dict = [
+            (k, type(v).__name__) for k, v in schema.items() if not isinstance(v, dict)
+        ]
+        if non_dict:
+            preview = ", ".join(f"'{k}'({tn})" for k, tn in non_dict[:5])
+            errors.append(
+                f"응답 형식 값이 dict가 아닌 키 {len(non_dict)}건: {preview}. "
+                "각 키는 type·scale/options·description 등을 dict로 정의해야 합니다."
+            )
+
     runner_path = Path(__file__).parent / "llm_runner.py"
     if runner_path.exists():
         src = runner_path.read_text(encoding="utf-8")

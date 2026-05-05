@@ -133,6 +133,9 @@ ACTIVE_PHASES = {
     "cross_cluster_diff",
     "raw_retrieval",
     "synthesizing",
+    # 후반 빌드 phase (5-03 갈래 C-β 신설 — frontend-obs/dist + cache 공유 차원의 동시 측정 차단용)
+    "observable_build",
+    "observable_pdf",
 }
 
 # phase 한글 표기 — status.json의 phase 코드를 사용자 화면용 라벨로 매핑.
@@ -149,6 +152,8 @@ PHASE_LABELS_KO = {
     "cross_cluster_diff":   "클러스터 비교 중",
     "raw_retrieval":        "원본 발췌 중",
     "synthesizing":         "보고서 합성 중",
+    "observable_build":     "결과 페이지 빌드 중",
+    "observable_pdf":       "결과 PDF 생성 중",
     "done":                 "완료",
     "cancelled":            "취소됨",
     "error":                "오류",
@@ -184,12 +189,17 @@ QUESTION_GEN_SYSTEM = textwrap.dedent("""\
 ## 응답 스키마 (JSON)
 ```json
 {
-  "field_1": "값 또는 척도 설명",
-  "field_2": "..."
+  "field_1": {"type": "likert_5", "scale": "1=전혀 그렇지 않다 ~ 5=매우 그렇다", "description": "질문 의도에 대한 짧은 설명"},
+  "field_2": {"type": "single_choice", "options": ["A", "B", "C"], "description": "..."},
+  "field_3": {"type": "free_text", "min_length": 50, "description": "자유 서술용"}
 }
 ```
 
 규칙:
+- 각 응답 키의 값은 반드시 dict 형식으로 정의 (문자열 한 줄 설명만 두면 차트·분포 분석에서 모두 누락됩니다).
+- numeric: `type`을 `likert_5`/`likert_7`/`integer` 중 선택, `scale`로 척도 의미를 한 줄 설명.
+- categorical: `type=single_choice` 또는 `multi_choice` + `options` 배열로 허용값 명시.
+- freetext: `type=free_text` + `min_length` 권장. 50~200자 범위로 길이 제한.
 - 질문은 페르소나 1명 분량 30초 이내로 답할 수 있게 짧게.
 - 척도는 1~5 또는 1~7 likert를 우선 검토.
 - 자유 응답은 한 응답당 1개 이내, 50~200자로 길이를 제한.
