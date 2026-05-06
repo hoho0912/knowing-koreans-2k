@@ -144,6 +144,177 @@ DYNAMIC_USER_TEMPLATE = textwrap.dedent("""\
 """)
 
 
+# schema 정의에서 사용되는 키들 — dict-wrap 응답 패턴 인식에 사용.
+# 응답값이 dict이고 본 키 중 2개 이상 보유하면 hermes-4-405b 류의 nested
+# wrap 패턴으로 인식하고 description leaf 를 응답값으로 unwrap.
+_SCHEMA_DEF_KEYS = frozenset({
+    "type", "scale", "options", "enum", "description",
+    "min_length", "max_length",
+})
+
+
+def _unwrap_dict_response(v: Any) -> Any:
+    """dict-wrap 응답 패턴이면 description leaf 추출, 단순 값이면 그대로 반환.
+
+    배경: hermes-4-405b 가 모든 응답을 nested dict 로 감싸서 회신하는 패턴.
+    예) {"type": "integer", "scale": "1~5 Likert ...", "description": 2}
+        ↑ 이 객체에서 진짜 응답값은 description 필드의 2.
+
+    인식 규칙: v 가 dict 이고 _SCHEMA_DEF_KEYS 중 2개 이상 보유하면
+    nested wrap 으로 인식 → description leaf 반환. description 이 없으면
+    원본 dict 그대로 반환 (검증 단에서 schema-echo 로 fail 처리).
+
+    knowing-koreans 2026-05-06 외부 리뷰 #2 데이터 테스트로 발견된 패턴.
+    """
+    if not isinstance(v, dict):
+        return v
+    overlap = _SCHEMA_DEF_KEYS & set(v.keys())
+    if len(overlap) < 2:
+        return v
+    if "description" not in v:
+        return v
+    return v["description"]
+
+
+def _try_int_in_schema_range(v: Any, t: str, scale: str) -> Optional[int]:
+    """정수 변환 + likert/integer scale 범위 검증. 통과 시 int, 실패 시 None.
+
+    frontend-obs/src/data/scenario.json.py:to_int_in_range / _detect_schema 와
+    동일 분류로 동작 — type=likert_5/likert/integer는 [1,5], likert_7는 [1,7],
+    또는 scale 텍스트의 '1~5', '1-7' 등을 정규식으로 추출.
+    """
+    try:
+        if isinstance(v, str):
+            m = re.search(r"-?\d+", v)
+            if not m:
+                return None
+            n = int(m.group(0))
+        elif isinstance(v, bool):
+            return None
+        elif isinstance(v, (int, float)):
+            if isinstance(v, float) and v != v:  # NaN
+                return None
+            n = int(v)
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    if t == "likert_7":
+        lo, hi = 1, 7
+    elif t in ("likert_5", "likert"):
+        lo, hi = 1, 5
+    else:
+        m = re.search(r"(\d+)\s*[-~∼]\s*(\d+)", str(scale))
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+        else:
+            keys = sorted({int(k) for k in re.findall(r"(\d+)\s*=", str(scale))})
+            if len(keys) >= 2:
+                lo, hi = keys[0], keys[-1]
+            else:
+                lo, hi = 1, 5  # default
+
+    return n if lo <= n <= hi else None
+
+
+def validate_response_against_schema(
+    parsed: Dict[str, Any],
+    schema_block: str,
+) -> Optional[str]:
+    """parse_json_response 결과가 schema_block 정의대로 응답됐는지 검증.
+
+    None 반환 = PASS. str 반환 = error reason (worker가 ok=False로 기록).
+
+    검증 분류 (frontend-obs loader 와 동일):
+      - 응답값이 dict: schema echo 사고 (모델이 schema 정의 자체를 회신) → fail
+      - numeric (integer / likert / likert_5 / likert_7 또는 scale 안 'likert'):
+        정수 변환 + 범위 검증
+      - categorical (single_choice / multi_choice 또는 options 보유):
+        options 안에 포함되는지 검증
+      - freetext (free_text / freetext / text / string + min_length 또는
+        '자유'/'서술' 표지): min_length 검증 + description echo 검출
+
+    schema_block 파싱 실패·미정의 시 검증 skip(PASS) — 호환성 유지.
+    외부 리뷰 #2 (knowing-koreans 2026-05-06) 도입.
+    """
+    if not schema_block or not schema_block.strip():
+        return None
+    try:
+        schema = json.loads(schema_block)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(schema, dict):
+        return None
+
+    fails: List[str] = []
+    for key, q_def in schema.items():
+        if not isinstance(q_def, dict):
+            continue  # validate_spec이 별도 차단 (외부 리뷰 #5)
+        if key not in parsed:
+            continue  # 응답 누락은 별도 영역 (parse 단계의 키 결손)
+
+        # B안 — dict-wrap 응답이면 description leaf 추출 후 검증
+        v = _unwrap_dict_response(parsed[key])
+        t = (q_def.get("type") or "").lower().strip()
+
+        if isinstance(v, dict):
+            fails.append(f"{key}=dict(schema-echo)")
+            continue
+
+        # description echo 검출 — unwrap된 값이 schema_block의 description과 같으면
+        # 모델이 답을 안 하고 schema 정의를 그대로 회신한 사고
+        expected_desc = (q_def.get("description") or "").strip()
+        if expected_desc and isinstance(v, str) and v.strip() == expected_desc:
+            fails.append(f"{key}=description-echo")
+            continue
+
+        scale = q_def.get("scale", "")
+        is_numeric = (
+            t in ("integer", "likert", "likert_5", "likert_7")
+            or "likert" in str(scale).lower()
+        )
+        if is_numeric:
+            if _try_int_in_schema_range(v, t, scale) is None:
+                preview = repr(v)[:30]
+                fails.append(f"{key}={preview}(non-numeric/out-of-range)")
+            continue
+
+        options = q_def.get("options") or q_def.get("enum")
+        if t in ("single_choice", "multi_choice") or (
+            isinstance(options, list) and len(options) > 0
+        ):
+            if isinstance(options, list) and options:
+                opts_str = [str(o) for o in options]
+                if t == "multi_choice" and isinstance(v, list):
+                    bad = [str(x) for x in v if str(x) not in opts_str]
+                    if bad:
+                        fails.append(f"{key} bad-options:{bad[:3]}")
+                else:
+                    if str(v).strip() not in opts_str:
+                        preview = repr(v)[:30]
+                        fails.append(f"{key}={preview}(not-in-options)")
+            continue
+
+        if t in ("free_text", "freetext", "text", "string"):
+            min_len = q_def.get("min_length")
+            if min_len:
+                v_str = str(v) if v is not None else ""
+                if len(v_str) < int(min_len):
+                    fails.append(f"{key}=len{len(v_str)}<min{min_len}")
+                    continue
+            desc = (q_def.get("description") or "").strip()
+            if desc and isinstance(v, str) and v.strip() == desc:
+                fails.append(f"{key}=description-echo")
+            continue
+
+    if fails:
+        head = ", ".join(fails[:3])
+        tail = f" (+{len(fails) - 3} more)" if len(fails) > 3 else ""
+        return f"schema fail: {head}{tail}"
+    return None
+
+
 def build_response_example(schema_block: str) -> str:
     """schema_block(JSON)에서 LLM에 보여줄 응답 예시 JSON을 자동 생성.
 
@@ -1807,9 +1978,22 @@ def main(run_dir: Path) -> int:
                     try:
                         parsed = parse_json_response(resp.text)
                         if isinstance(parsed, dict):
+                            # 외부 리뷰 #2 (5-06) 옵션 ㄴ — dict-wrap 응답을
+                            # description leaf 로 unwrap 후 row 저장. nested
+                            # dict 가 CSV 에 그대로 직렬화되면 frontend loader 의
+                            # 정수 변환·options 매칭이 부정확해지는 사고 차단.
                             for k, v in parsed.items():
-                                row[f"resp_{k}"] = v
-                            row["ok"] = True
+                                row[f"resp_{k}"] = _unwrap_dict_response(v)
+                            # schema_block 기반 검증 — 실패 시 ok=False 유지 +
+                            # error 기록 → _ok_df() 자동 제외로 인사이트 LLM
+                            # 입력 / 통계 표본에서 자동 차단.
+                            schema_fail = validate_response_against_schema(
+                                parsed, schema_block
+                            )
+                            if schema_fail:
+                                row["error"] = schema_fail
+                            else:
+                                row["ok"] = True
                         else:
                             row["error"] = f"JSON이 dict가 아님: {type(parsed).__name__}"
                     except json.JSONDecodeError as e:
