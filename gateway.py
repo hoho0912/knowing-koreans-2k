@@ -117,7 +117,11 @@ ANALYSIS_LLM_MODELS = [
 ]
 
 QGEN_MODEL_DEFAULT = "openrouter/anthropic/claude-sonnet-4.6"
-REPORT_MODEL_DEFAULT = "openrouter/anthropic/claude-opus-4.7"
+# 분석 LLM default — Grok 4.20 (2M context · prompt cache · reasoning 강점). 사용자가
+# selectbox 에서 다른 후보(Opus 4.7 / Sonnet 4.6 / Grok 4-fast / Qwen Plus thinking)
+# 로 직접 전환 가능. 변경 배경: 5-01 본 라운드 N=1000 측정에서 Grok 4.20 단독 선정 +
+# 2M context 장점이 본 라운드 외 일반 측정에도 default 가치 있음 (5-06 결정).
+REPORT_MODEL_DEFAULT = "openrouter/x-ai/grok-4.20"
 
 # 진행 중 phase 집합 (1단계 카드 / 동시성 정책 / 4단계 polling 분기)
 ACTIVE_PHASES = {
