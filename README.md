@@ -11,6 +11,14 @@ NVIDIA Nemotron-Personas-Korea 700만 합성 페르소나에 박물관·문화·
 ## 버전 / 변경 이력
 
 
+### v0.3.2 · 2026-05-06 — 외부 리뷰 후속 fix (ACTIVE_PHASES 동기화 + schema 검증 강화)
+
+- `gateway.py` ACTIVE_PHASES 에 후반 빌드 phase 2 종 추가 (`observable_build` / `observable_pdf`) + PHASE_LABELS_KO 한글 라벨 매핑 — 측정 후반 빌드 동안 동시 측정 시작/삭제 차단으로 `frontend-obs/dist` + cache 공유 디렉토리 동시 쓰기 사고 방지
+- `gateway.py` QUESTION_GEN_SYSTEM 응답 스키마 예시를 string-value 에서 dict 형식 3종(`likert_5` / `single_choice` / `free_text`)으로 갱신 + dict 형식 의무 규칙 추가 — LLM 이 차트·분포 분석에 적합한 dict schema 를 생성하도록 prompt 차원에서 보강
+- `backend/run_validate.py` validate_spec 게이트 강화 — schema dict 각 value 가 dict 형식인지 강제. string-value spec 이 worker 진입 전 차단
+- `backend/run_worker.py` 에 schema_block 기반 응답값 검증 함수 (`validate_response_against_schema`) 추가 — type=integer/likert*은 정수 변환 + 범위, single_choice/multi_choice 는 options 매칭, freetext 는 min_length + description echo 검출. 검증 실패 응답은 `ok=False` + `error="schema fail: ..."` 로 분류 → `_ok_df()` 자동 제외로 인사이트 LLM 입력 / 통계 표본에서 자동 차단
+- dict-wrap 응답 패턴 처리 (`_unwrap_dict_response`) — schema 정의 키(`type` / `scale` / `options` / `description` 등) 2 개 이상 보유 + description leaf 보유 dict 응답이면 description 값을 평면값으로 unwrap. nested dict 가 CSV 에 string 으로 직렬화되어 frontend loader 의 정수 변환·options 매칭이 부정확해지는 사고 차단
+
 ### v0.3.1 · 2026-05-04 — 보고서 구조 ①~⑧ 재정렬 + 분석 표 LLM 자율 결정
 
 - 보고서 합성 LLM 산출물을 5섹션 JSON으로 재설계 (`analysis_tables` / `key_findings` / `curator_hypotheses` / `responses_to_chew_on` / `next_questions`)
